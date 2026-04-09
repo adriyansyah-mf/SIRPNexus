@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import ipaddress
 import json
+import logging
 import os
 import re
 import time
@@ -19,6 +20,8 @@ from redis.asyncio import Redis
 
 app = FastAPI(title="Alert Service")
 Instrumentator().instrument(app).expose(app)
+
+opencti_log = logging.getLogger("sirp.opencti")
 
 producer: AIOKafkaProducer | None = None
 redis_client: Redis | None = None
@@ -380,29 +383,76 @@ async def _secret_value(name: str) -> str:
     return os.getenv(name, "")
 
 
+def _opencti_debug_enabled() -> bool:
+    return os.getenv("OPENCTI_DEBUG_LOG", "").lower() in ("1", "true", "yes")
+
+
+def _oc_dbg(msg: str, *args: object) -> None:
+    if _opencti_debug_enabled():
+        opencti_log.info("[opencti] " + msg, *args)
+
+
+async def _secret_get_http_only(name: str) -> str:
+    """Read secret from secret-service only (no os.getenv). Used after env so .env wins over stale DB rows."""
+    if not INTERNAL_SERVICE_TOKEN:
+        if _opencti_debug_enabled() and name.startswith("OPENCTI"):
+            _oc_dbg("secret-service: INTERNAL_SERVICE_TOKEN empty; cannot fetch %s", name)
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"{SECRET_SERVICE_URL}/secrets/{name}",
+                headers={"x-internal-token": INTERNAL_SERVICE_TOKEN},
+            )
+            if _opencti_debug_enabled() and name.startswith("OPENCTI"):
+                _oc_dbg("secret-service GET /secrets/%s -> HTTP %s", name, resp.status_code)
+            if resp.status_code == 200:
+                return str(resp.json().get("value", ""))
+    except Exception as exc:
+        if _opencti_debug_enabled() and name.startswith("OPENCTI"):
+            _oc_dbg("secret-service GET /secrets/%s failed: %s", name, exc)
+    return ""
+
+
+async def _opencti_config_str(key: str) -> str:
+    """OpenCTI settings: non-empty environment variable wins over secret-service (avoids bad DB token masking good .env)."""
+    v = (os.getenv(key, "") or "").strip()
+    if v:
+        _oc_dbg("config %s: source=env len=%d", key, len(v))
+        return v
+    sv = (await _secret_get_http_only(key)).strip()
+    if sv:
+        _oc_dbg("config %s: source=secret-service len=%d", key, len(sv))
+        return sv
+    _oc_dbg("config %s: empty (no env value, secret missing or empty)", key)
+    return ""
+
+
 def _opencti_normalize_pat(raw: str) -> str:
-    """Strip whitespace and a single leading 'Bearer ' so we do not send 'Bearer Bearer …'."""
-    t = (raw or "").strip()
+    """Strip whitespace, BOM, a single leading 'Bearer ', and internal newlines from pasted tokens."""
+    t = (raw or "").strip().lstrip("\ufeff")
     if len(t) >= 7 and t[:7].lower() == "bearer ":
         t = t[7:].strip()
+    t = "".join(t.split())  # remove spaces/newlines inside UUID/token pastes
     return t
 
 
 async def _opencti_pat_from_store() -> str:
     for key in ("OPENCTI_TOKEN", "OPENCTI_API_KEY"):
-        v = _opencti_normalize_pat(await _secret_value(key))
+        raw = await _opencti_config_str(key)
+        v = _opencti_normalize_pat(raw)
         if v:
+            _oc_dbg("PAT chosen from key=%s normalized_len=%d", key, len(v))
             return v
-        v = _opencti_normalize_pat(os.getenv(key, ""))
-        if v:
-            return v
+    _oc_dbg("no PAT from OPENCTI_TOKEN / OPENCTI_API_KEY")
     return ""
 
 
 OPENCTI_AUTH_HINT = (
     "Use a Personal Access Token from OpenCTI (avatar → Profile → API / access tokens). "
-    "In secret-service store the token only under OPENCTI_TOKEN (or OPENCTI_API_KEY); do not prefix with 'Bearer '. "
-    "Connector IDs are not user tokens. Alternatively set OPENCTI_USER + OPENCTI_PASSWORD for login."
+    "Environment variables OPENCTI_TOKEN / OPENCTI_API_KEY override secret-service if both are set (fix stale DB entries). "
+    "Store the raw token only (no 'Bearer ' prefix). Connector IDs are not user tokens. "
+    "Or set OPENCTI_USER + OPENCTI_PASSWORD for GraphQL login."
 )
 
 
@@ -411,16 +461,26 @@ async def _opencti_resolve_bearer(base_url: str) -> str:
     global _opencti_login_jwt, _opencti_login_jwt_at
     pat = await _opencti_pat_from_store()
     if pat:
+        _oc_dbg("auth: using personal access token (Bearer len=%d)", len(pat))
         return pat
     now = time.monotonic()
     if _opencti_login_jwt and (now - _opencti_login_jwt_at) < _OPENCTI_LOGIN_JWT_TTL_SEC:
+        _oc_dbg("auth: using cached GraphQL-login JWT (len=%d, age_s=%.0f)", len(_opencti_login_jwt), now - _opencti_login_jwt_at)
         return _opencti_login_jwt
-    email = ((await _secret_value("OPENCTI_USER")) or (await _secret_value("OPENCTI_EMAIL")) or "").strip()
+    email = (await _opencti_config_str("OPENCTI_USER")) or (await _opencti_config_str("OPENCTI_EMAIL"))
     if not email:
         email = (os.getenv("OPENCTI_USER") or os.getenv("OPENCTI_EMAIL") or "").strip()
-    password = ((await _secret_value("OPENCTI_PASSWORD")) or os.getenv("OPENCTI_PASSWORD", "")).strip()
+    password = (await _opencti_config_str("OPENCTI_PASSWORD")).strip()
     if not email or not password:
+        _oc_dbg("auth: no PAT and no OPENCTI_USER/PASSWORD for GraphQL login")
         return ""
+    dom = email.split("@", 1)[-1] if "@" in email else "?"
+    _oc_dbg(
+        "auth: GraphQL token() login (email_len=%d domain=%s password_len=%d)",
+        len(email),
+        dom,
+        len(password),
+    )
     login_body: dict[str, Any] = {
         "query": "mutation OpenctiLogin($input: UserLoginInput!) { token(input: $input) }",
         "variables": {"input": {"email": email, "password": password}},
@@ -433,7 +493,9 @@ async def _opencti_resolve_bearer(base_url: str) -> str:
                 headers={"Content-Type": "application/json"},
             )
         except httpx.RequestError as exc:
+            _oc_dbg("GraphQL login request error: %s", exc)
             raise HTTPException(status_code=502, detail=f"OpenCTI login unreachable: {exc}") from exc
+    _oc_dbg("GraphQL login HTTP status=%s", resp.status_code)
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -442,6 +504,7 @@ async def _opencti_resolve_bearer(base_url: str) -> str:
     body = resp.json()
     errs = body.get("errors")
     if errs:
+        _oc_dbg("GraphQL login errors: %s", json.dumps(errs, default=str)[:1500])
         raise HTTPException(status_code=502, detail=f"OpenCTI login failed: {errs}")
     tok = body.get("data", {}).get("token")
     if not tok:
@@ -449,6 +512,7 @@ async def _opencti_resolve_bearer(base_url: str) -> str:
     jwt = _opencti_normalize_pat(str(tok))
     _opencti_login_jwt = jwt
     _opencti_login_jwt_at = now
+    _oc_dbg("GraphQL login OK, JWT len=%d", len(jwt))
     return jwt
 
 
@@ -460,22 +524,34 @@ async def _opencti_post_graphql(
 ) -> dict[str, Any]:
     bearer = await _opencti_resolve_bearer(base_url)
     if not bearer:
+        _oc_dbg("graphql aborted: no bearer (set OPENCTI_TOKEN / OPENCTI_API_KEY or OPENCTI_USER+OPENCTI_PASSWORD)")
         raise HTTPException(
             status_code=400,
             detail=f"OpenCTI authentication missing. {OPENCTI_AUTH_HINT}",
         )
     headers = {"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"}
+    op = (gql_payload.get("query") or "")[:80].replace("\n", " ")
+    _oc_dbg("graphql POST %s/graphql op≈%r bearer_len=%d", base_url, op, len(bearer))
     async with httpx.AsyncClient(timeout=45) as client:
         try:
             resp = await client.post(f"{base_url}/graphql", json=gql_payload, headers=headers)
         except httpx.RequestError as exc:
+            _oc_dbg("graphql transport error: %s", exc)
             raise HTTPException(status_code=502, detail=f"OpenCTI unreachable: {exc}") from exc
+    _oc_dbg("graphql HTTP status=%s body_len=%d", resp.status_code, len(resp.content or b""))
     if resp.status_code >= 400:
+        _oc_dbg("graphql error body (truncated): %s", (resp.text or "")[:500])
         raise HTTPException(
             status_code=502,
             detail=f"OpenCTI HTTP {resp.status_code}: {resp.text[:800]}",
         )
     payload = resp.json()
+    gql_errs = payload.get("errors")
+    if gql_errs:
+        _oc_dbg("graphql response errors: %s", json.dumps(gql_errs, default=str)[:2000])
+    elif _opencti_debug_enabled():
+        data_keys = list((payload.get("data") or {}).keys())
+        _oc_dbg("graphql OK data keys=%s", data_keys)
     if raise_on_graphql_error:
         errs = payload.get("errors")
         if errs:
@@ -536,11 +612,10 @@ async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _pull_opencti(limit: int = 100) -> int:
-    base_url = (await _secret_value("OPENCTI_URL")).strip().rstrip("/")
-    if not base_url:
-        base_url = os.getenv("OPENCTI_URL", "").strip().rstrip("/")
+    base_url = (await _opencti_config_str("OPENCTI_URL")).strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="OpenCTI configuration missing: OPENCTI_URL")
+    _oc_dbg("pull_opencti start base_url=%s limit=%d", base_url, limit)
 
     query = """
     query ListObservables($first: Int!) {
@@ -580,6 +655,7 @@ async def _pull_opencti(limit: int = 100) -> int:
         out = await _ingest(_normalize_opencti(node))
         if out.get("status") != "duplicate":
             ingested += 1
+    _oc_dbg("pull_opencti done edges=%d new_ingested=%d", len(edges), ingested)
     return ingested
 
 
@@ -607,9 +683,7 @@ query OpenctiObservableLookup($search: String!, $first: Int!) {
 
 async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str, Any]:
     """Call OpenCTI GraphQL stixCyberObservables(search=...) — same /graphql as bulk pull."""
-    base_url = (await _secret_value("OPENCTI_URL")).strip().rstrip("/")
-    if not base_url:
-        base_url = os.getenv("OPENCTI_URL", "").strip().rstrip("/")
+    base_url = (await _opencti_config_str("OPENCTI_URL")).strip().rstrip("/")
     if not base_url:
         raise HTTPException(
             status_code=400,
@@ -648,6 +722,14 @@ async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str
             for e in gql_errors
         ):
             auth_hint = OPENCTI_AUTH_HINT
+    _oc_dbg(
+        "lookup done search_len=%d first=%d matches=%d graphql_errors=%s auth_hint=%s",
+        len(st),
+        first,
+        len(matches),
+        bool(gql_errors),
+        bool(auth_hint),
+    )
     return {
         "search": st,
         "matches": matches,
@@ -663,9 +745,9 @@ async def _opencti_sync_loop():
     while True:
         try:
             await _pull_opencti(limit=limit)
-        except Exception:
+        except Exception as exc:
             # Keep periodic sync alive; temporary OpenCTI errors should not stop service.
-            pass
+            _oc_dbg("auto-sync pull failed: %s", repr(exc)[:400])
         await asyncio.sleep(interval)
 
 
@@ -719,6 +801,11 @@ async def startup():
         "CREATE TABLE IF NOT EXISTS alerts ("
         "id TEXT PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
     )
+    if _opencti_debug_enabled():
+        opencti_log.info(
+            "[opencti] OPENCTI_DEBUG_LOG enabled — logger=%s (no secrets logged)",
+            opencti_log.name,
+        )
     if os.getenv("OPENCTI_AUTO_SYNC_ENABLED", "false").lower() == "true":
         opencti_sync_task = asyncio.create_task(_opencti_sync_loop())
 
