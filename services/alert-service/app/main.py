@@ -98,11 +98,14 @@ def _extract_observables(text: str) -> list[dict[str, str]]:
         _add("hash", h.lower())
     for h in set(re.findall(r"\b[a-fA-F0-9]{32}\b", text)):
         _add("hash", h.lower())
-    # Domain extraction — skip bare IPs already captured
+    # Domain extraction — skip bare IPs and obvious filenames (eve.json, etc.)
     for domain in set(re.findall(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b", text)):
         dl = domain.lower()
-        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", dl):
-            _add("domain", dl)
+        if re.match(r"^\d+\.\d+\.\d+\.\d+$", dl):
+            continue
+        if re.search(r"\.(json|xml|log|txt|yml|yaml|js|css|sh|py|php|conf|cfg|ini)$", dl, re.I):
+            continue
+        _add("domain", dl)
     return out
 
 
@@ -630,20 +633,71 @@ async def update_alert_status(alert_id: str, body: dict[str, str]):
     return alert
 
 
+_ANALYZER_IOC_TYPES = frozenset({"ip", "domain", "url", "hash", "email"})
+
+
+def _normalize_ioc_for_analyzer(raw_type: str) -> str | None:
+    t = (raw_type or "").strip().lower()
+    if t == "hostname":
+        t = "domain"
+    return t if t in _ANALYZER_IOC_TYPES else None
+
+
 @app.post("/alerts/{alert_id}/run-analyzers")
 async def run_analyzers(alert_id: str):
     alert = await _get_alert_or_404(alert_id)
-    for observable in alert.get("observables", []):
+    observables = alert.get("observables", [])
+    queued = 0
+    for observable in observables:
+        raw_t = str(observable.get("type") or "").lower()
+        ioc_type = _normalize_ioc_for_analyzer(raw_t)
+        if not ioc_type:
+            continue
+        v = observable.get("value")
+        if v is None or str(v).strip() == "":
+            continue
         await _publish(
             "analyzers.jobs",
             {
                 "alert_id": alert_id,
                 "severity": alert.get("severity"),
-                "type": observable.get("type"),
-                "value": observable.get("value"),
+                "type": ioc_type,
+                "value": str(v).strip()[:800],
             },
         )
-    return {"status": "queued", "observable_count": len(alert.get("observables", []))}
+        queued += 1
+    return {
+        "status": "queued",
+        "observable_count": len(observables),
+        "queued_count": queued,
+    }
+
+
+@app.post("/alerts/{alert_id}/observables/analyze")
+async def analyze_single_observable(alert_id: str, body: dict[str, Any]):
+    """Queue one IOC for the analyzer service (Threat Intel), keyed by alert_id for result storage."""
+    alert = await _get_alert_or_404(alert_id)
+    raw_type = str(body.get("type") or "").strip().lower()
+    ioc_type = _normalize_ioc_for_analyzer(raw_type)
+    if not ioc_type:
+        raise HTTPException(
+            status_code=400,
+            detail=f"IOC type '{raw_type or 'missing'}' is not supported for Threat Intel analyzers",
+        )
+    val = body.get("value")
+    if val is None or str(val).strip() == "":
+        raise HTTPException(status_code=400, detail="value required")
+    v = str(val).strip()[:800]
+    await _publish(
+        "analyzers.jobs",
+        {
+            "alert_id": alert_id,
+            "severity": alert.get("severity"),
+            "type": ioc_type,
+            "value": v,
+        },
+    )
+    return {"status": "queued", "type": ioc_type, "value": v[:200]}
 
 
 def _sanitize_observables(raw: Any) -> list[dict[str, str]]:

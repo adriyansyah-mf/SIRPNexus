@@ -137,11 +137,13 @@ export default function AlertsPage() {
 
   const runAnalyzers = async (id: string) => {
     const token = localStorage.getItem('sirp_token') || '';
-    await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/run-analyzers`, {
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/run-analyzers`, {
       method: 'POST',
       headers: token ? { authorization: `Bearer ${token}` } : {},
     });
-    notify('Analyzer jobs queued');
+    const data = (await res.json().catch(() => ({}))) as { queued_count?: number };
+    const n = data.queued_count;
+    notify(typeof n === 'number' ? `Threat Intel: ${n} job(s) queued` : 'Analyzer jobs queued');
   };
 
   const escalate = async (id: string) => {

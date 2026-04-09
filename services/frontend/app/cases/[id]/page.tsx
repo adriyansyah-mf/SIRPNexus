@@ -56,6 +56,18 @@ function relTime(ts?: string) {
   return h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
 }
 
+/** Maps case observable type to analyzer IOC type (hostname → domain); null = no Threat Intel runner. */
+function analyzerIocType(t: string | undefined): string | null {
+  const u = (t || '').toLowerCase();
+  if (u === 'hostname') return 'domain';
+  if (['ip', 'domain', 'url', 'hash', 'email'].includes(u)) return u;
+  return null;
+}
+
+function observableRowKey(o: { type: string; value: string }, i: number) {
+  return `${i}:${o.type}:${o.value}`;
+}
+
 export default function CaseDetail({ params }: { params: { id: string } }) {
   const [c, setC] = useState<Case | null>(null);
   const [results, setResults] = useState<AnalyzerResult[]>([]);
@@ -64,6 +76,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
   const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables' | 'forensics'>('overview');
+  const [queueAllBusy, setQueueAllBusy] = useState(false);
+  const [rowAnalyzeBusy, setRowAnalyzeBusy] = useState<Record<string, boolean>>({});
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
@@ -118,6 +132,48 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments/${cid}`, { method: 'DELETE', headers: authHdr });
     notify('Comment deleted');
     load();
+  };
+
+  const queueThreatIntelAll = async () => {
+    if (!c?.alert_id) return;
+    setQueueAllBusy(true);
+    try {
+      const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}/run-analyzers`, {
+        method: 'POST',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      });
+      const data = (await res.json().catch(() => ({}))) as { queued_count?: number; detail?: string };
+      if (!res.ok) {
+        notify(typeof data.detail === 'string' ? data.detail : `Threat Intel queue failed (${res.status})`);
+        return;
+      }
+      const n = data.queued_count ?? 0;
+      notify(n > 0 ? `Threat Intel: ${n} job(s) queued — check Forensics` : 'No supported observables to queue (ip, domain, url, hash, email)');
+      load();
+    } finally {
+      setQueueAllBusy(false);
+    }
+  };
+
+  const queueThreatIntelOne = async (o: { type: string; value: string }, rk: string) => {
+    if (!c?.alert_id) return;
+    setRowAnalyzeBusy((prev) => ({ ...prev, [rk]: true }));
+    try {
+      const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}/observables/analyze`, {
+        method: 'POST',
+        headers: authHdr,
+        body: JSON.stringify({ type: o.type, value: o.value }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { detail?: string };
+      if (!res.ok) {
+        notify(typeof data.detail === 'string' ? data.detail : `Analyze failed (${res.status})`);
+        return;
+      }
+      notify('Threat Intel job queued — check Forensics');
+      load();
+    } finally {
+      setRowAnalyzeBusy((prev) => ({ ...prev, [rk]: false }));
+    }
   };
 
   const addTask = async () => {
@@ -308,18 +364,63 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
       {/* Observables */}
       {tab === 'observables' && (
-        <table className="data-table">
-          <thead><tr><th>Type</th><th>Value</th></tr></thead>
-          <tbody>
-            {(c.observables || []).map((o, i) => (
-              <tr key={i}>
-                <td><span className="badge badge-info">{o.type}</span></td>
-                <td className="mono">{o.value}</td>
+        <div>
+          <div className="flex items-center gap-2 mb-3" style={{ flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!c?.alert_id || queueAllBusy}
+              onClick={() => void queueThreatIntelAll()}
+            >
+              {queueAllBusy ? 'Queueing…' : 'Queue all (Threat Intel)'}
+            </button>
+            {!c?.alert_id && (
+              <span className="text-muted" style={{ fontSize: 13 }}>
+                Link this case to an alert to run analyzers; results appear under Forensics.
+              </span>
+            )}
+          </div>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Value</th>
+                <th style={{ width: 140 }}>Threat Intel</th>
               </tr>
-            ))}
-            {!c.observables?.length && <tr><td colSpan={2}><div className="empty-state">No observables.</div></td></tr>}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {(c.observables || []).map((o, i) => {
+                const rk = observableRowKey(o, i);
+                const supported = analyzerIocType(o.type) != null;
+                const busy = rowAnalyzeBusy[rk];
+                return (
+                  <tr key={rk}>
+                    <td><span className="badge badge-info">{o.type}</span></td>
+                    <td className="mono">{o.value}</td>
+                    <td>
+                      {!c?.alert_id ? (
+                        <span className="text-muted" style={{ fontSize: 12 }}>—</span>
+                      ) : !supported ? (
+                        <span className="text-muted" style={{ fontSize: 12 }} title="No automated analyzer for this type">—</span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          style={{ fontSize: 12, padding: '4px 10px' }}
+                          disabled={busy}
+                          onClick={() => void queueThreatIntelOne(o, rk)}
+                        >
+                          {busy ? '…' : 'Analyze'}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {!c.observables?.length && <tr><td colSpan={3}><div className="empty-state">No observables.</div></td></tr>}
+            </tbody>
+          </table>
+        </div>
       )}
 
       {/* Forensics */}
