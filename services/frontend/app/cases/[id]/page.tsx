@@ -1,7 +1,7 @@
 'use client';
 
 import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 type Case = {
   id: string;
@@ -22,12 +22,6 @@ type Case = {
   observables?: { type: string; value: string }[];
 };
 
-type AnalyzerResult = {
-  value?: string;
-  type?: string;
-  result?: { risk?: { verdict?: string; final_score?: number } };
-};
-
 function sevBadge(sev?: string) {
   const s = (sev || 'medium').toLowerCase();
   return <span className={`badge badge-${s}`}>{s}</span>;
@@ -36,12 +30,6 @@ function sevBadge(sev?: string) {
 function statusBadge(st?: string) {
   const s = (st || 'open').toLowerCase().replace(' ', '-');
   return <span className={`badge badge-${s}`}>{st || 'open'}</span>;
-}
-
-function verdictBadge(v?: string) {
-  if (!v) return <span className="text-muted">—</span>;
-  const map: Record<string, string> = { malicious: 'critical', suspicious: 'high', benign: 'low' };
-  return <span className={`badge badge-${map[v.toLowerCase()] || 'info'}`}>{v}</span>;
 }
 
 function relTime(ts?: string) {
@@ -56,28 +44,15 @@ function relTime(ts?: string) {
   return h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
 }
 
-/** Maps case observable type to analyzer IOC type (hostname → domain); null = no Threat Intel runner. */
-function analyzerIocType(t: string | undefined): string | null {
-  const u = (t || '').toLowerCase();
-  if (u === 'hostname') return 'domain';
-  if (['ip', 'domain', 'url', 'hash', 'email'].includes(u)) return u;
-  return null;
-}
-
-function observableRowKey(o: { type: string; value: string }, i: number) {
-  return `${i}:${o.type}:${o.value}`;
-}
+const OPENCTI_URL = (process.env.NEXT_PUBLIC_OPENCTI_URL || '').trim();
 
 export default function CaseDetail({ params }: { params: { id: string } }) {
   const [c, setC] = useState<Case | null>(null);
-  const [results, setResults] = useState<AnalyzerResult[]>([]);
   const [toast, setToast] = useState('');
   const [commentText, setCommentText] = useState('');
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
-  const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables' | 'forensics'>('overview');
-  const [queueAllBusy, setQueueAllBusy] = useState(false);
-  const [rowAnalyzeBusy, setRowAnalyzeBusy] = useState<Record<string, boolean>>({});
+  const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
@@ -95,13 +70,6 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     if (!res.ok) return;
     const data = await res.json();
     setC(data);
-    if (data.alert_id) {
-      const r = await fetch(
-        `${CLIENT_API_PREFIX}/analyzers/results?alert_id=${encodeURIComponent(data.alert_id)}`,
-        { cache: 'no-store', headers: h },
-      );
-      if (r.ok) setResults(await r.json());
-    }
   };
 
   useEffect(() => { load(); }, [params.id]);
@@ -134,48 +102,6 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     load();
   };
 
-  const queueThreatIntelAll = async () => {
-    if (!c?.alert_id) return;
-    setQueueAllBusy(true);
-    try {
-      const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}/run-analyzers`, {
-        method: 'POST',
-        headers: token ? { authorization: `Bearer ${token}` } : {},
-      });
-      const data = (await res.json().catch(() => ({}))) as { queued_count?: number; detail?: string };
-      if (!res.ok) {
-        notify(typeof data.detail === 'string' ? data.detail : `Threat Intel queue failed (${res.status})`);
-        return;
-      }
-      const n = data.queued_count ?? 0;
-      notify(n > 0 ? `Threat Intel: ${n} job(s) queued — check Forensics` : 'No supported observables to queue (ip, domain, url, hash, email)');
-      load();
-    } finally {
-      setQueueAllBusy(false);
-    }
-  };
-
-  const queueThreatIntelOne = async (o: { type: string; value: string }, rk: string) => {
-    if (!c?.alert_id) return;
-    setRowAnalyzeBusy((prev) => ({ ...prev, [rk]: true }));
-    try {
-      const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}/observables/analyze`, {
-        method: 'POST',
-        headers: authHdr,
-        body: JSON.stringify({ type: o.type, value: o.value }),
-      });
-      const data = (await res.json().catch(() => ({}))) as { detail?: string };
-      if (!res.ok) {
-        notify(typeof data.detail === 'string' ? data.detail : `Analyze failed (${res.status})`);
-        return;
-      }
-      notify('Threat Intel job queued — check Forensics');
-      load();
-    } finally {
-      setRowAnalyzeBusy((prev) => ({ ...prev, [rk]: false }));
-    }
-  };
-
   const addTask = async () => {
     if (!taskTitle.trim()) return;
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks`, {
@@ -202,7 +128,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     load();
   };
 
-  const tabStyle = (t: typeof tab): React.CSSProperties => ({
+  const tabStyle = (t: typeof tab): CSSProperties => ({
     padding: '8px 14px', cursor: 'pointer', fontSize: 13, fontWeight: tab === t ? 600 : 400,
     color: tab === t ? 'var(--text-primary)' : 'var(--text-secondary)',
     borderBottom: tab === t ? '2px solid var(--accent-blue)' : '2px solid transparent',
@@ -240,12 +166,11 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 16 }}>
-        {(['overview', 'tasks', 'comments', 'timeline', 'observables', 'forensics'] as const).map((t) => (
+        {(['overview', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
           <button key={t} style={tabStyle(t)} onClick={() => setTab(t)}>
             {t.charAt(0).toUpperCase() + t.slice(1)}
             {t === 'tasks' && c.tasks?.length ? ` (${c.tasks.length})` : ''}
             {t === 'comments' && c.comments?.length ? ` (${c.comments.length})` : ''}
-            {t === 'forensics' && results.length ? ` (${results.length})` : ''}
           </button>
         ))}
       </div>
@@ -365,82 +290,36 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       {/* Observables */}
       {tab === 'observables' && (
         <div>
-          <div className="flex items-center gap-2 mb-3" style={{ flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              className="btn-primary"
-              disabled={!c?.alert_id || queueAllBusy}
-              onClick={() => void queueThreatIntelAll()}
-            >
-              {queueAllBusy ? 'Queueing…' : 'Queue all (Threat Intel)'}
-            </button>
-            {!c?.alert_id && (
-              <span className="text-muted" style={{ fontSize: 13 }}>
-                Link this case to an alert to run analyzers; results appear under Forensics.
-              </span>
-            )}
-          </div>
+          {OPENCTI_URL ? (
+            <p className="text-muted mb-3" style={{ fontSize: 13 }}>
+              IOC enrichment runs in{' '}
+              <a href={OPENCTI_URL} target="_blank" rel="noopener noreferrer">OpenCTI</a>
+              {' '}(sync from OpenCTI into SIRP is configured via <code className="mono">OPENCTI_*</code> on alert-service).
+            </p>
+          ) : (
+            <p className="text-muted mb-3" style={{ fontSize: 13 }}>
+              Set <code className="mono">NEXT_PUBLIC_OPENCTI_URL</code> for a quick link to OpenCTI. Threat intel sync uses{' '}
+              <code className="mono">OPENCTI_URL</code> / <code className="mono">OPENCTI_TOKEN</code> on alert-service.
+            </p>
+          )}
           <table className="data-table">
             <thead>
               <tr>
                 <th>Type</th>
                 <th>Value</th>
-                <th style={{ width: 140 }}>Threat Intel</th>
               </tr>
             </thead>
             <tbody>
-              {(c.observables || []).map((o, i) => {
-                const rk = observableRowKey(o, i);
-                const supported = analyzerIocType(o.type) != null;
-                const busy = rowAnalyzeBusy[rk];
-                return (
-                  <tr key={rk}>
-                    <td><span className="badge badge-info">{o.type}</span></td>
-                    <td className="mono">{o.value}</td>
-                    <td>
-                      {!c?.alert_id ? (
-                        <span className="text-muted" style={{ fontSize: 12 }}>—</span>
-                      ) : !supported ? (
-                        <span className="text-muted" style={{ fontSize: 12 }} title="No automated analyzer for this type">—</span>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn-primary"
-                          style={{ fontSize: 12, padding: '4px 10px' }}
-                          disabled={busy}
-                          onClick={() => void queueThreatIntelOne(o, rk)}
-                        >
-                          {busy ? '…' : 'Analyze'}
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-              {!c.observables?.length && <tr><td colSpan={3}><div className="empty-state">No observables.</div></td></tr>}
+              {(c.observables || []).map((o, i) => (
+                <tr key={`${i}:${o.type}:${o.value}`}>
+                  <td><span className="badge badge-info">{o.type}</span></td>
+                  <td className="mono">{o.value}</td>
+                </tr>
+              ))}
+              {!c.observables?.length && <tr><td colSpan={2}><div className="empty-state">No observables.</div></td></tr>}
             </tbody>
           </table>
         </div>
-      )}
-
-      {/* Forensics */}
-      {tab === 'forensics' && (
-        <table className="data-table">
-          <thead>
-            <tr><th>IOC</th><th>Type</th><th>Verdict</th><th>Score</th></tr>
-          </thead>
-          <tbody>
-            {results.map((r, i) => (
-              <tr key={i}>
-                <td className="mono truncate" style={{ maxWidth: 220 }}>{r.value || '—'}</td>
-                <td><span className="badge badge-info">{r.type || '—'}</span></td>
-                <td>{verdictBadge(r.result?.risk?.verdict)}</td>
-                <td className="mono">{r.result?.risk?.final_score != null ? `${r.result.risk.final_score}/100` : '—'}</td>
-              </tr>
-            ))}
-            {!results.length && <tr><td colSpan={4}><div className="empty-state">No analyzer results.</div></td></tr>}
-          </tbody>
-        </table>
       )}
 
       {toast && <div className="toast success">{toast}</div>}

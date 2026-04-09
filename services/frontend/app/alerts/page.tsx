@@ -135,17 +135,6 @@ export default function AlertsPage() {
     load();
   };
 
-  const runAnalyzers = async (id: string) => {
-    const token = localStorage.getItem('sirp_token') || '';
-    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/run-analyzers`, {
-      method: 'POST',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
-    });
-    const data = (await res.json().catch(() => ({}))) as { queued_count?: number };
-    const n = data.queued_count;
-    notify(typeof n === 'number' ? `Threat Intel: ${n} job(s) queued` : 'Analyzer jobs queued');
-  };
-
   const escalate = async (id: string) => {
     const token = localStorage.getItem('sirp_token') || '';
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/escalate`, {
@@ -290,7 +279,6 @@ export default function AlertsPage() {
                   <button onClick={() => { setModal({ type: 'assign', id: a.id }); setModalInput(a.assigned_to || ''); }}>Assign</button>
                   <button onClick={() => { setModal({ type: 'tags', id: a.id, current: a.tags || [] }); setModalInput((a.tags || []).join(', ')); }}>Tags</button>
                   <button onClick={() => { setModal({ type: 'status', id: a.id }); setModalInput(a.status || 'triaged'); }}>Status</button>
-                  <button onClick={() => runAnalyzers(a.id)}>Analyze</button>
                   <button onClick={() => escalate(a.id)} className="btn-danger">Escalate</button>
                 </div>
               </td>

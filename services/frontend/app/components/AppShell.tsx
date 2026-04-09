@@ -5,16 +5,17 @@ import { usePathname } from 'next/navigation';
 import AuthBar from './AuthBar';
 import UtcClock from './UtcClock';
 
-const NAV_ITEMS = [
-  { label: 'Dashboard',   href: '/' },
-  { label: 'Alerts',      href: '/alerts' },
-  { label: 'Cases',       href: '/cases' },
+const INTERNAL_NAV = [
+  { label: 'Dashboard', href: '/' },
+  { label: 'Alerts', href: '/alerts' },
+  { label: 'Cases', href: '/cases' },
   { label: 'Observables', href: '/observables' },
-  { label: 'Forensics',   href: '/analyzers' },
-  { label: 'Playbooks',   href: '/playbooks' },
-  { label: 'Statistics',  href: '/statistics' },
-  { label: 'Admin',       href: '/admin' },
-];
+  { label: 'Playbooks', href: '/playbooks' },
+  { label: 'Statistics', href: '/statistics' },
+  { label: 'Admin', href: '/admin' },
+] as const;
+
+const OPENCTI_URL = (process.env.NEXT_PUBLIC_OPENCTI_URL || '').trim();
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -26,7 +27,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <header className="app-topnav">
         <div className="app-brand">SIRP<span>Nexus</span></div>
         <nav className="app-nav">
-          {NAV_ITEMS.map((item) => (
+          {INTERNAL_NAV.map((item) => (
             <Link
               key={item.href}
               href={item.href}
@@ -35,6 +36,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               {item.label}
             </Link>
           ))}
+          {OPENCTI_URL ? (
+            <a href={OPENCTI_URL} target="_blank" rel="noopener noreferrer" title="OpenCTI in new tab">
+              OpenCTI ↗
+            </a>
+          ) : null}
         </nav>
         <div className="app-auth">
           <AuthBar />

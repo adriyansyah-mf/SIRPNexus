@@ -35,7 +35,7 @@ function relTime(ts?: string) {
 }
 
 const ACTION_TYPES = ['firewall_block', 'wazuh_active_response', 'edr_isolate', 'webhook_notify'];
-const TRIGGER_TYPES = ['analyzer_result', 'case_event', 'manual'];
+const TRIGGER_TYPES = ['case_event', 'manual'];
 
 export default function PlaybooksPage() {
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
@@ -45,8 +45,8 @@ export default function PlaybooksPage() {
   const [toast, setToast] = useState('');
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
   const [form, setForm] = useState({
-    name: '', description: '', trigger: 'analyzer_result', enabled: true,
-    conditions: [{ field: 'ioc_type', op: 'eq', value: 'ip' }],
+    name: '', description: '', trigger: 'case_event', enabled: true,
+    conditions: [{ field: 'event', op: 'eq', value: 'created' }],
     actions: [{ type: 'firewall_block', params: { target_field: 'value' } }],
   });
 

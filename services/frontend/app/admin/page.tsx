@@ -25,11 +25,7 @@ const ROLE_COLORS: Record<Role, string> = {
 /* ── Secrets config ─────────────────────────────────────────────────────────── */
 const SECRET_GROUPS: { label: string; keys: string[] }[] = [
   {
-    label: 'Analyzer APIs',
-    keys: ['ABUSEIPDB_API_KEY', 'IPINFO_TOKEN', 'VIRUSTOTAL_API_KEY', 'URLSCAN_API_KEY', 'GOOGLE_SAFE_BROWSING_API_KEY', 'MALWAREBAZAAR_API_KEY'],
-  },
-  {
-    label: 'Threat Intelligence',
+    label: 'Threat Intelligence (OpenCTI)',
     keys: ['OPENCTI_URL', 'OPENCTI_TOKEN'],
   },
   {
@@ -255,7 +251,7 @@ export default function AdminPage() {
                 <span>·</span>
                 <span>
                   {r === 'admin' && 'Full access, manage users & secrets'}
-                  {r === 'analyst' && 'Cases, analyzers, alerts triage'}
+                  {r === 'analyst' && 'Cases, alerts triage, OpenCTI sync (server)'}
                   {r === 'responder' && 'Alerts triage, containment actions'}
                   {r === 'readonly' && 'Read-only across all resources'}
                 </span>

@@ -84,7 +84,6 @@ async def startup():
     global consumer
     consumer = AIOKafkaConsumer(
         "cases.updated",
-        "analyzers.results",
         bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
         group_id="notification-service",
     )

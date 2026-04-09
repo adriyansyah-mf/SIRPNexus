@@ -1,9 +1,8 @@
 """
 Automation / SOAR-lite Service
-- Kafka consumer on analyzers.results and cases.updated
+- Kafka consumer on cases.updated
 - Playbook engine: stored playbooks with conditions + action steps
 - Manual trigger: POST /automation/run-playbook/{id}
-- Auto-trigger: severity + score thresholds
 """
 import asyncio
 import json
@@ -42,35 +41,6 @@ db_pool: asyncpg.Pool | None = None
 
 # ── Built-in playbooks (always available) ─────────────────────────────────────
 BUILTIN_PLAYBOOKS: list[dict[str, Any]] = [
-    {
-        "id": "pb-block-malicious-ip",
-        "name": "Block Malicious IP",
-        "description": "Block IP on firewall + Wazuh active response when AbuseIPDB score ≥ 75",
-        "trigger": "analyzer_result",
-        "conditions": [
-            {"field": "ioc_type", "op": "eq", "value": "ip"},
-            {"field": "risk.final_score", "op": "gte", "value": 75},
-        ],
-        "actions": [
-            {"type": "firewall_block", "params": {"target_field": "value"}},
-            {"type": "wazuh_active_response", "params": {"command": "firewall-drop", "target_field": "value"}},
-        ],
-        "enabled": True,
-    },
-    {
-        "id": "pb-isolate-host-hash",
-        "name": "Isolate Host on Malicious Hash",
-        "description": "Send EDR isolation request when hash is malicious and VT score ≥ 80",
-        "trigger": "analyzer_result",
-        "conditions": [
-            {"field": "ioc_type", "op": "eq", "value": "hash"},
-            {"field": "risk.final_score", "op": "gte", "value": 80},
-        ],
-        "actions": [
-            {"type": "edr_isolate", "params": {"target_field": "value"}},
-        ],
-        "enabled": True,
-    },
     {
         "id": "pb-notify-critical-case",
         "name": "Notify on Critical Case Created",
@@ -256,17 +226,7 @@ async def kafka_worker():
             data = json.loads(msg.value.decode())
             topic = msg.topic
 
-            if topic == "analyzers.results":
-                # Flatten result structure for condition matching
-                event = {
-                    "ioc_type": data.get("type"),
-                    "value": data.get("value"),
-                    "alert_id": data.get("alert_id"),
-                    "risk": data.get("result", {}).get("risk", {}),
-                }
-                await _run_matching_playbooks("analyzer_result", event)
-
-            elif topic == "cases.updated":
+            if topic == "cases.updated":
                 event = data  # already flat: {event, case_id, ...}
                 await _run_matching_playbooks("case_event", event)
 
@@ -281,7 +241,6 @@ async def kafka_worker():
 async def startup():
     global consumer, db_pool
     consumer = AIOKafkaConsumer(
-        "analyzers.results",
         "cases.updated",
         bootstrap_servers=KAFKA,
         group_id="automation-service",
@@ -342,8 +301,8 @@ async def get_playbook(pb_id: str):
 async def create_playbook(body: dict[str, Any]):
     if not body.get("name") or not body.get("trigger"):
         raise HTTPException(status_code=400, detail="name and trigger required")
-    if body.get("trigger") not in {"analyzer_result", "case_event", "manual"}:
-        raise HTTPException(status_code=400, detail="trigger must be analyzer_result | case_event | manual")
+    if body.get("trigger") not in {"case_event", "manual"}:
+        raise HTTPException(status_code=400, detail="trigger must be case_event | manual")
     pb_id = body.get("id") or f"pb-{uuid.uuid4().hex[:8]}"
     pb = {
         "id": pb_id,
@@ -430,9 +389,6 @@ async def list_runs(limit: int = 50):
 # ── Legacy single-run endpoint (backward compat) ──────────────────────────────
 @app.post("/automation/run-once")
 async def run_once(event: dict[str, Any]):
-    results = await _run_matching_playbooks("analyzer_result", {
-        "ioc_type": event.get("job", {}).get("type"),
-        "value": event.get("job", {}).get("value"),
-        "risk": event.get("result", {}).get("risk", {}),
-    })
+    """Run playbooks with trigger=manual against the provided event payload."""
+    results = await _run_matching_playbooks("manual", event if isinstance(event, dict) else {})
     return {"status": "processed", "triggered": results}

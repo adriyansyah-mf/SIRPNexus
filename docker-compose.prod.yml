@@ -167,28 +167,6 @@ services:
       resources:
         limits: { cpus: "0.5", memory: 256M }
 
-  analyzer-service:
-    build: ./services/analyzer-service
-    restart: always
-    env_file: .env
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      secret-service:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits: { cpus: "1.0", memory: 512M }
-
   automation-service:
     build: ./services/automation-service
     restart: always
@@ -234,8 +212,6 @@ services:
       case-service:
         condition: service_healthy
       observable-service:
-        condition: service_healthy
-      analyzer-service:
         condition: service_healthy
       notification-service:
         condition: service_healthy

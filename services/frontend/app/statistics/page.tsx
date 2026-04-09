@@ -32,12 +32,6 @@ type Observable = {
   tags?: string[];
 };
 
-type AnalyzerResult = {
-  type?: string;
-  value?: string;
-  result?: { risk?: { verdict?: string; final_score?: number } };
-};
-
 /* ── Compute helpers ─────────────────────────────────────────────────────────── */
 function countBy<T>(items: T[], key: (item: T) => string): Record<string, number> {
   const acc: Record<string, number> = {};
@@ -185,11 +179,10 @@ function SectionCard({ title, dot, children }: { title: string; dot?: string; ch
 
 /* ── Page ───────────────────────────────────────────────────────────────────── */
 export default async function StatisticsPage() {
-  const [alerts, cases, observables, results] = await Promise.all([
+  const [alerts, cases, observables] = await Promise.all([
     serverJson<Alert[]>('/alerts/alerts'),
     serverJson<Case[]>('/cases/cases'),
     serverJson<Observable[]>('/observables/observables'),
-    serverJson<AnalyzerResult[]>('/analyzers/results'),
   ]);
 
   /* ── Alert stats ──────────────────────────────────────────────────────── */
@@ -215,10 +208,6 @@ export default async function StatisticsPage() {
   const obsTotal = observables.length;
   const obsByType = countBy(observables, (o) => o.type?.toLowerCase() || 'unknown');
   const obsNew = observables.filter((o) => o.new).length;
-  const obsMalicious = results.filter((r) => r.result?.risk?.verdict?.toLowerCase() === 'malicious').length;
-  const obsSuspicious = results.filter((r) => r.result?.risk?.verdict?.toLowerCase() === 'suspicious').length;
-  const obsBenign = results.filter((r) => r.result?.risk?.verdict?.toLowerCase() === 'benign').length;
-  const resultByType = countBy(results, (r) => r.type?.toLowerCase() || 'unknown');
   const obsTimeline = timelineBuckets(observables);
 
   /* ── TTP stats ────────────────────────────────────────────────────────── */
@@ -383,11 +372,9 @@ export default async function StatisticsPage() {
 
         {/* ── OBSERVABLES STATISTICS ────────────────────────────────────────── */}
         <SectionCard title="Observables Statistics" dot="dot-cyan">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 8, marginBottom: 16, borderBottom: '1px solid var(--border-subtle)', paddingBottom: 12 }}>
-            <StatNumber value={obsNew}        label="New"        color="var(--accent-blue)" />
-            <StatNumber value={obsMalicious}  label="Malicious"  color="var(--sev-critical)" />
-            <StatNumber value={obsSuspicious} label="Suspicious" color="var(--sev-high)" />
-            <StatNumber value={obsBenign}     label="Benign"     color="var(--accent-green)" />
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2,1fr)', gap: 8, marginBottom: 16, borderBottom: '1px solid var(--border-subtle)', paddingBottom: 12 }}>
+            <StatNumber value={obsNew} label="New (dedupe window)" color="var(--accent-blue)" />
+            <StatNumber value={obsTotal} label="Total tracked" color="var(--accent-cyan)" />
           </div>
 
           <div style={{ marginBottom: 14 }}>
@@ -398,16 +385,6 @@ export default async function StatisticsPage() {
               <HBar key={k} label={k} count={v} total={obsTotal} color={OBS_COLORS[k] || 'var(--accent-blue)'} />
             ))}
             {!obsTotal && <div className="empty-state">No observables yet.</div>}
-          </div>
-
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-muted)', marginBottom: 8 }}>
-              Analyzer Results by IOC Type
-            </div>
-            {sortedEntries(resultByType).map(([k, v]) => (
-              <HBar key={k} label={k} count={v} total={results.length} color={OBS_COLORS[k] || 'var(--accent-blue)'} />
-            ))}
-            {!results.length && <div className="empty-state">No analyzer results yet.</div>}
           </div>
 
           <div>

@@ -13,19 +13,16 @@ const MAX_EVENTS = 30;
 
 const ICON: Record<string, string> = {
   'alerts.normalized': '⚠',
-  'analyzers.results': '◎',
   'cases.updated': '⬡',
 };
 
 const ICON_CLS: Record<string, string> = {
   'alerts.normalized': 'fi-red',
-  'analyzers.results': 'fi-cyan',
   'cases.updated': 'fi-amber',
 };
 
 function topicLabel(topic: string): string {
   if (topic.startsWith('alerts')) return 'ALERT';
-  if (topic.startsWith('analyzers')) return 'ANALYZER';
   if (topic.startsWith('cases')) return 'CASE';
   return topic.toUpperCase();
 }
@@ -34,7 +31,6 @@ function eventSummary(topic: string, payload: string): string {
   try {
     const d = JSON.parse(payload);
     if (topic.startsWith('alerts')) return d.title || 'New alert ingested';
-    if (topic.startsWith('analyzers')) return `${d.type || '?'}: ${d.value || '?'} → ${d.result?.risk?.verdict || 'pending'}`;
     if (topic.startsWith('cases')) return `${d.event || 'event'}: ${d.case?.title || d.case_id || '?'}`;
   } catch {
     // fallback

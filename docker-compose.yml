@@ -61,7 +61,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports: ["8000:8000"]
-    depends_on: [alert-service, case-service, observable-service, analyzer-service, notification-service, secret-service]
+    depends_on: [alert-service, case-service, observable-service, notification-service, secret-service]
   alert-service:
     build: ./services/alert-service
     restart: unless-stopped
@@ -77,11 +77,6 @@ services:
     restart: unless-stopped
     env_file: .env
     depends_on: [postgres, redis, kafka, elasticsearch]
-  analyzer-service:
-    build: ./services/analyzer-service
-    restart: unless-stopped
-    env_file: .env
-    depends_on: [postgres, redis, kafka, secret-service]
   secret-service:
     build: ./services/secret-service
     env_file: .env

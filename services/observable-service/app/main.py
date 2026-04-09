@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 
 import asyncpg
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer
 from elasticsearch import AsyncElasticsearch
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -14,7 +14,6 @@ from redis.asyncio import Redis
 app = FastAPI(title="Observable Service")
 Instrumentator().instrument(app).expose(app)
 
-producer: AIOKafkaProducer | None = None
 consumer: AIOKafkaConsumer | None = None
 redis_client: Redis | None = None
 es: AsyncElasticsearch | None = None
@@ -32,9 +31,7 @@ def _now() -> str:
 
 @app.on_event("startup")
 async def startup():
-    global producer, consumer, redis_client, es, db_pool
-    producer = AIOKafkaProducer(bootstrap_servers=KAFKA)
-    await producer.start()
+    global consumer, redis_client, es, db_pool
     consumer = AIOKafkaConsumer("observables.created", bootstrap_servers=KAFKA, group_id="observable-service")
     await consumer.start()
     redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
@@ -59,8 +56,6 @@ async def startup():
 async def shutdown():
     if consumer:
         await consumer.stop()
-    if producer:
-        await producer.stop()
     if redis_client:
         await redis_client.close()
     if es:
@@ -101,7 +96,7 @@ async def list_observables():
 @app.post("/observables")
 async def create_observable(data: dict):
     _validate_ioc(data)
-    assert redis_client and producer and es
+    assert redis_client and es
     key = f"ioc:{data['type']}:{data['value']}"
     created = await redis_client.set(key, "1", ex=86400, nx=True)
     doc_id = f"{data['type']}:{data['value']}"
@@ -115,7 +110,6 @@ async def create_observable(data: dict):
             json.dumps(doc),
         )
     await es.index(index="observables", document=doc)
-    await producer.send_and_wait("analyzers.jobs", json.dumps(doc).encode())
     return doc
 
 

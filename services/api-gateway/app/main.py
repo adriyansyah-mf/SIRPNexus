@@ -44,7 +44,6 @@ SERVICE_MAP = {
     "alerts":        _env_url("ALERT_SERVICE_URL",        "http://alert-service:8001"),
     "cases":         _env_url("CASE_SERVICE_URL",         "http://case-service:8001"),
     "observables":   _env_url("OBSERVABLE_SERVICE_URL",   "http://observable-service:8001"),
-    "analyzers":     _env_url("ANALYZER_SERVICE_URL",     "http://analyzer-service:8001"),
     "automation":    _env_url("AUTOMATION_SERVICE_URL",   "http://automation-service:8001"),
     "notifications": _env_url("NOTIFICATION_SERVICE_URL", "http://notification-service:8001"),
     "secrets":       _env_url("SECRET_SERVICE_URL",       "http://secret-service:8001"),
@@ -466,7 +465,6 @@ async def stream_events(websocket: WebSocket):
     await websocket.accept()
     consumer = AIOKafkaConsumer(
         "alerts.normalized",
-        "analyzers.results",
         "cases.updated",
         bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
         group_id=None,
@@ -497,7 +495,7 @@ async def proxy(service: str, path: str, request: Request):
     auth = request.headers.get("authorization", "")
 
     # Services that require authentication at all times
-    AUTH_REQUIRED = {"secrets", "cases", "analyzers", "automation", "notifications", "alerts", "observables"}
+    AUTH_REQUIRED = {"secrets", "cases", "automation", "notifications", "alerts", "observables"}
 
     if service in AUTH_REQUIRED and not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
@@ -509,7 +507,7 @@ async def proxy(service: str, path: str, request: Request):
             _require_role(claims, {"analyst", "responder", "admin", "readonly"})
             if request.method not in {"GET", "HEAD", "OPTIONS"} and not _require_role_soft(claims, {"analyst", "responder", "admin"}):
                 raise HTTPException(status_code=403, detail="Write access requires analyst role or above")
-        if service in {"cases", "analyzers", "automation", "notifications"}:
+        if service in {"cases", "automation", "notifications"}:
             _require_role(claims, {"analyst", "responder", "admin", "readonly"})
         if service == "secrets":
             _require_role(claims, {"admin"})
