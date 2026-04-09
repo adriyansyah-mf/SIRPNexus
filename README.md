@@ -215,3 +215,8 @@ Supported runtime keys include SIEM, OpenCTI, SMTP, and webhook credentials (e.g
 ```bash
 pytest -q tests
 ```
+
+## ❤️ Support This Project
+If you find this useful, consider sponsoring me on GitHub!
+
+👉 https://github.com/sponsors/adriyansyah-mf
