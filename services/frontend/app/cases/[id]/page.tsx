@@ -1,6 +1,7 @@
 'use client';
 
 import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
+import { openctiKnowledgeSearchUrl } from '../../../lib/openctiLinks';
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
 type Case = {
@@ -20,6 +21,30 @@ type Case = {
   comments?: { id: string; author: string; text: string; at: string; edited?: boolean }[];
   tasks?: { id: string; title: string; status: string; assigned_to?: string }[];
   observables?: { type: string; value: string }[];
+};
+
+type OpenctiMatch = {
+  id?: string;
+  standard_id?: string;
+  entity_type?: string;
+  observable_value?: string;
+  description?: string;
+  confidence?: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type OpenctiLookupModal = {
+  iocType: string;
+  iocValue: string;
+  loading: boolean;
+  error: string | null;
+  result: {
+    search: string;
+    matches: OpenctiMatch[];
+    page_info?: { globalCount?: number };
+    graphql_errors?: unknown;
+  } | null;
 };
 
 function sevBadge(sev?: string) {
@@ -53,6 +78,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
   const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
+  const [openctiModal, setOpenctiModal] = useState<OpenctiLookupModal | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
@@ -73,6 +99,48 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   useEffect(() => { load(); }, [params.id]);
+
+  const lookupOpenctiGraphql = async (o: { type: string; value: string }) => {
+    setOpenctiModal({
+      iocType: o.type,
+      iocValue: o.value,
+      loading: true,
+      error: null,
+      result: null,
+    });
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/opencti/lookup`, {
+      method: 'POST',
+      headers: authHdr,
+      body: JSON.stringify({ value: o.value, type: o.type, first: 25 }),
+    });
+    const data = (await res.json().catch(() => ({}))) as {
+      detail?: string;
+      search?: string;
+      matches?: OpenctiMatch[];
+      page_info?: { globalCount?: number };
+      graphql_errors?: unknown;
+    };
+    if (!res.ok) {
+      const msg = typeof data.detail === 'string' ? data.detail : `OpenCTI lookup failed (${res.status})`;
+      setOpenctiModal((m) => (m ? { ...m, loading: false, error: msg } : null));
+      return;
+    }
+    setOpenctiModal((m) =>
+      m
+        ? {
+            ...m,
+            loading: false,
+            error: null,
+            result: {
+              search: data.search || o.value,
+              matches: Array.isArray(data.matches) ? data.matches : [],
+              page_info: data.page_info,
+              graphql_errors: data.graphql_errors,
+            },
+          }
+        : null,
+    );
+  };
 
   const setStatus = async (status: string) => {
     const actor = token ? 'admin' : 'ui';
@@ -290,35 +358,126 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       {/* Observables */}
       {tab === 'observables' && (
         <div>
-          {OPENCTI_URL ? (
-            <p className="text-muted mb-3" style={{ fontSize: 13 }}>
-              IOC enrichment runs in{' '}
-              <a href={OPENCTI_URL} target="_blank" rel="noopener noreferrer">OpenCTI</a>
-              {' '}(sync from OpenCTI into SIRP is configured via <code className="mono">OPENCTI_*</code> on alert-service).
-            </p>
-          ) : (
-            <p className="text-muted mb-3" style={{ fontSize: 13 }}>
-              Set <code className="mono">NEXT_PUBLIC_OPENCTI_URL</code> for a quick link to OpenCTI. Threat intel sync uses{' '}
-              <code className="mono">OPENCTI_URL</code> / <code className="mono">OPENCTI_TOKEN</code> on alert-service.
-            </p>
-          )}
+          <p className="text-muted mb-3" style={{ fontSize: 13 }}>
+            <strong>Lookup</strong> calls OpenCTI <code className="mono">POST …/graphql</code> (<code className="mono">stixCyberObservables(search: …)</code>).
+            Uses <code className="mono">OPENCTI_URL</code> + <code className="mono">OPENCTI_TOKEN</code> on alert-service (DB secrets or env).
+            {OPENCTI_URL ? (
+              <> Optional <strong>UI ↗</strong> opens the web app in a new tab.</>
+            ) : null}
+          </p>
           <table className="data-table">
             <thead>
               <tr>
                 <th>Type</th>
                 <th>Value</th>
+                <th style={{ minWidth: 200 }}>OpenCTI</th>
               </tr>
             </thead>
             <tbody>
-              {(c.observables || []).map((o, i) => (
-                <tr key={`${i}:${o.type}:${o.value}`}>
-                  <td><span className="badge badge-info">{o.type}</span></td>
-                  <td className="mono">{o.value}</td>
-                </tr>
-              ))}
-              {!c.observables?.length && <tr><td colSpan={2}><div className="empty-state">No observables.</div></td></tr>}
+              {(c.observables || []).map((o, i) => {
+                const uiHref = openctiKnowledgeSearchUrl(o.value);
+                return (
+                  <tr key={`${i}:${o.type}:${o.value}`}>
+                    <td><span className="badge badge-info">{o.type}</span></td>
+                    <td className="mono">{o.value}</td>
+                    <td>
+                      <div className="flex gap-1" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          style={{ fontSize: 12, padding: '4px 10px' }}
+                          onClick={() => void lookupOpenctiGraphql(o)}
+                        >
+                          Lookup
+                        </button>
+                        {uiHref ? (
+                          <a
+                            href={uiHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ fontSize: 12 }}
+                          >
+                            UI ↗
+                          </a>
+                        ) : null}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+              {!c.observables?.length && <tr><td colSpan={3}><div className="empty-state">No observables.</div></td></tr>}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {openctiModal && (
+        <div className="modal-backdrop" onClick={() => setOpenctiModal(null)}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-title">
+              OpenCTI GraphQL · <span className="mono" style={{ fontWeight: 400 }}>{openctiModal.iocValue}</span>
+              <span className="badge badge-info ml-2" style={{ fontSize: 10 }}>{openctiModal.iocType}</span>
+            </div>
+            {openctiModal.loading && <div className="empty-state">Querying OpenCTI…</div>}
+            {openctiModal.error && (
+              <div className="card" style={{ padding: 12, borderColor: 'var(--sev-high)' }}>
+                <div style={{ fontSize: 13, color: 'var(--sev-high)' }}>{openctiModal.error}</div>
+              </div>
+            )}
+            {!openctiModal.loading && openctiModal.result && (
+              <div style={{ maxHeight: '60vh', overflow: 'auto' }}>
+                {openctiModal.result.graphql_errors ? (
+                  <pre className="mono" style={{ fontSize: 11, color: 'var(--sev-high)', marginBottom: 12 }}>
+                    {JSON.stringify(openctiModal.result.graphql_errors, null, 2)}
+                  </pre>
+                ) : null}
+                {openctiModal.result.page_info?.globalCount != null && (
+                  <div className="text-muted mb-2" style={{ fontSize: 12 }}>
+                    Global count (platform): {openctiModal.result.page_info.globalCount}
+                  </div>
+                )}
+                {!openctiModal.result.matches.length && !openctiModal.result.graphql_errors ? (
+                  <div className="empty-state">No matching cyber observables in OpenCTI for this search.</div>
+                ) : null}
+                {openctiModal.result.matches.length > 0 && (
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Type</th>
+                        <th>Value</th>
+                        <th>Confidence</th>
+                        <th className="hide-mobile">ID</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {openctiModal.result.matches.map((m, j) => (
+                        <tr key={m.id || j}>
+                          <td><span className="badge badge-info">{m.entity_type || '—'}</span></td>
+                          <td className="mono" style={{ maxWidth: 240 }}>{m.observable_value || '—'}</td>
+                          <td>{m.confidence != null ? String(m.confidence) : '—'}</td>
+                          <td className="mono hide-mobile" style={{ fontSize: 10 }}>{m.id || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+                {openctiModal.result.matches.some((m) => m.description) ? (
+                  <div style={{ marginTop: 12 }}>
+                    {openctiModal.result.matches.map((m, j) =>
+                      m.description ? (
+                        <div key={`d-${m.id || j}`} className="text-muted" style={{ fontSize: 12, marginBottom: 8 }}>
+                          <strong>{m.observable_value}</strong>: {m.description}
+                        </div>
+                      ) : null,
+                    )}
+                  </div>
+                ) : null}
+              </div>
+            )}
+            <div className="modal-footer">
+              <button type="button" onClick={() => setOpenctiModal(null)}>Close</button>
+            </div>
+          </div>
         </div>
       )}
 

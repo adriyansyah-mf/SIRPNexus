@@ -471,6 +471,87 @@ async def _pull_opencti(limit: int = 100) -> int:
     return ingested
 
 
+_OPENCTI_LOOKUP_QUERY = """
+query OpenctiObservableLookup($search: String!, $first: Int!) {
+  stixCyberObservables(search: $search, first: $first, orderBy: updated_at, orderMode: desc) {
+    edges {
+      node {
+        id
+        standard_id
+        entity_type
+        observable_value
+        x_opencti_description
+        confidence
+        created_at
+        updated_at
+      }
+    }
+    pageInfo {
+      globalCount
+    }
+  }
+}
+"""
+
+
+async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str, Any]:
+    """Call OpenCTI GraphQL stixCyberObservables(search=...) — same /graphql as bulk pull."""
+    base_url = (await _secret_value("OPENCTI_URL")).rstrip("/")
+    token = await _secret_value("OPENCTI_TOKEN")
+    if not base_url or not token:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenCTI not configured: set OPENCTI_URL and OPENCTI_TOKEN (secret-service or env on alert-service)",
+        )
+    st = search_term.strip()
+    if not st:
+        raise HTTPException(status_code=400, detail="value required")
+    first = max(1, min(int(first), 50))
+    gql_body = {
+        "query": _OPENCTI_LOOKUP_QUERY,
+        "variables": {"search": st, "first": first},
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"{base_url}/graphql",
+                json=gql_body,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"OpenCTI unreachable: {exc}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenCTI HTTP {resp.status_code}: {resp.text[:800]}",
+        )
+    payload = resp.json()
+    gql_errors = payload.get("errors")
+    conn = (payload.get("data") or {}).get("stixCyberObservables") or {}
+    edges = conn.get("edges") or []
+    matches: list[dict[str, Any]] = []
+    for edge in edges:
+        n = edge.get("node") or {}
+        matches.append(
+            {
+                "id": n.get("id"),
+                "standard_id": n.get("standard_id"),
+                "entity_type": n.get("entity_type"),
+                "observable_value": n.get("observable_value"),
+                "description": n.get("x_opencti_description"),
+                "confidence": n.get("confidence"),
+                "created_at": n.get("created_at"),
+                "updated_at": n.get("updated_at"),
+            }
+        )
+    return {
+        "search": st,
+        "matches": matches,
+        "page_info": conn.get("pageInfo"),
+        "graphql_errors": gql_errors,
+    }
+
+
 async def _opencti_sync_loop():
     interval = int(os.getenv("OPENCTI_AUTO_SYNC_INTERVAL_SECONDS", "300"))
     limit = int(os.getenv("OPENCTI_QUERY_LIMIT", "100"))
@@ -555,6 +636,19 @@ async def shutdown():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.post("/opencti/lookup")
+async def opencti_lookup(body: dict[str, Any]):
+    """Lookup IOC in OpenCTI via POST {OPENCTI_URL}/graphql (stixCyberObservables search)."""
+    val = body.get("value")
+    if val is None or str(val).strip() == "":
+        raise HTTPException(status_code=400, detail="value required")
+    try:
+        first = int(body.get("first", 20))
+    except (TypeError, ValueError):
+        first = 20
+    return await _opencti_graphql_lookup(str(val).strip(), first=first)
 
 
 @app.middleware("http")

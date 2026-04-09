@@ -133,6 +133,7 @@ bash infra/kafka/create-topics.sh
   - Normalizes to internal alert schema
   - Publishes to Kafka (`alerts.*`, `observables.created`) like other sources
   - Can run periodic auto-sync loop when enabled
+- Per-IOC lookup (UI + API): `POST /alerts/opencti/lookup` with JSON `{"value": "<ioc>", "first": 20}` — server calls `{OPENCTI_URL}/graphql` with `stixCyberObservables(search: …)` (same token as pull).
 
 ### Generic SIEM
 
