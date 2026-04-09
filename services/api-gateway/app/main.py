@@ -34,6 +34,8 @@ INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 INBOUND_WEBHOOK_TOKEN = os.getenv("INBOUND_WEBHOOK_TOKEN", "")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(4 * 1024 * 1024)))  # 4 MB default
+# Multipart case evidence uploads (POST …/cases/cases/{id}/evidence)
+MAX_CASE_EVIDENCE_BYTES = int(os.getenv("MAX_CASE_EVIDENCE_BYTES", str(32 * 1024 * 1024)))
 
 # ── Service map ───────────────────────────────────────────────────────────────
 def _env_url(name: str, default: str) -> str:
@@ -92,7 +94,17 @@ async def security_headers(request: Request, call_next):
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_BODY_BYTES:
+    if not content_length:
+        return await call_next(request)
+    cl = int(content_length)
+    path = request.url.path
+    is_case_evidence_upload = (
+        request.method == "POST"
+        and path.startswith("/cases/cases/")
+        and path.rstrip("/").endswith("/evidence")
+    )
+    max_bytes = MAX_CASE_EVIDENCE_BYTES if is_case_evidence_upload else MAX_BODY_BYTES
+    if cl > max_bytes:
         return JSONResponse(status_code=413, content={"detail": "Request body too large"})
     return await call_next(request)
 

@@ -4,6 +4,15 @@ import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
 import { openctiKnowledgeSearchUrl } from '../../../lib/openctiLinks';
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 
+type CaseEvidence = {
+  id: string;
+  filename?: string;
+  size?: number;
+  content_type?: string;
+  uploaded_at?: string;
+  uploaded_by?: string | null;
+};
+
 type Case = {
   id: string;
   title?: string;
@@ -21,6 +30,7 @@ type Case = {
   comments?: { id: string; author: string; text: string; at: string; edited?: boolean }[];
   tasks?: { id: string; title: string; status: string; assigned_to?: string }[];
   observables?: { type: string; value: string }[];
+  evidence?: CaseEvidence[];
 };
 
 type OpenctiMatch = {
@@ -92,13 +102,33 @@ function relTime(ts?: string) {
 
 const OPENCTI_URL = (process.env.NEXT_PUBLIC_OPENCTI_URL || '').trim();
 
+function formatBytes(n?: number): string {
+  if (n == null || Number.isNaN(n)) return '—';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function jwtPreferredUsername(token: string): string {
+  try {
+    const p = token.split('.')[1];
+    const json = atob(p.replace(/-/g, '+').replace(/_/g, '/'));
+    const o = JSON.parse(json) as { preferred_username?: string; sub?: string };
+    return o.preferred_username || o.sub || 'user';
+  } catch {
+    return 'user';
+  }
+}
+
 export default function CaseDetail({ params }: { params: { id: string } }) {
   const [c, setC] = useState<Case | null>(null);
   const [toast, setToast] = useState('');
+  const [toastOk, setToastOk] = useState(true);
   const [commentText, setCommentText] = useState('');
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
-  const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
+  const [tab, setTab] = useState<'overview' | 'evidence' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
+  const [evidenceUploading, setEvidenceUploading] = useState(false);
   const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
   const [intelModal, setIntelModal] = useState<IntelLookupModal | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
@@ -106,10 +136,11 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
   const authHdr = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
 
-  const notify = (msg: string) => {
+  const notify = (msg: string, ok = true) => {
     setToast(msg);
+    setToastOk(ok);
     clearTimeout(toastRef.current);
-    toastRef.current = setTimeout(() => setToast(''), 3000);
+    toastRef.current = setTimeout(() => setToast(''), 4000);
   };
 
   const load = async () => {
@@ -251,6 +282,58 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     load();
   };
 
+  const uploadEvidence = async (files: FileList | null) => {
+    if (!files?.length) return;
+    const f = files[0];
+    setEvidenceUploading(true);
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('uploaded_by', token ? jwtPreferredUsername(token) : 'anonymous');
+    try {
+      const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence`, {
+        method: 'POST',
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        body: fd,
+      });
+      const data = (await res.json().catch(() => ({}))) as { detail?: string };
+      if (!res.ok) {
+        notify(typeof data.detail === 'string' ? data.detail : `Upload failed (${res.status})`, false);
+        return;
+      }
+      notify(`Uploaded: ${f.name}`);
+      load();
+    } finally {
+      setEvidenceUploading(false);
+    }
+  };
+
+  const downloadEvidence = async (eid: string, filename: string) => {
+    const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}/file`, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) {
+      notify(`Download failed (${res.status})`, false);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'evidence';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const deleteEvidence = async (eid: string) => {
+    if (!window.confirm('Remove this evidence file?')) return;
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}`, {
+      method: 'DELETE',
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    notify('Evidence removed');
+    load();
+  };
+
   const tabStyle = (t: typeof tab): CSSProperties => ({
     padding: '8px 14px', cursor: 'pointer', fontSize: 13, fontWeight: tab === t ? 600 : 400,
     color: tab === t ? 'var(--text-primary)' : 'var(--text-secondary)',
@@ -288,12 +371,13 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       </div>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 16 }}>
-        {(['overview', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
+      <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 16, flexWrap: 'wrap' }}>
+        {(['overview', 'evidence', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
           <button key={t} style={tabStyle(t)} onClick={() => setTab(t)}>
-            {t.charAt(0).toUpperCase() + t.slice(1)}
+            {t === 'evidence' ? 'Evidence' : t.charAt(0).toUpperCase() + t.slice(1)}
             {t === 'tasks' && c.tasks?.length ? ` (${c.tasks.length})` : ''}
             {t === 'comments' && c.comments?.length ? ` (${c.comments.length})` : ''}
+            {t === 'evidence' && c.evidence?.length ? ` (${c.evidence.length})` : ''}
           </button>
         ))}
       </div>
@@ -322,6 +406,75 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                   <td style={{ padding: '7px 0' }}>{v}</td>
                 </tr>
               ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Evidence */}
+      {tab === 'evidence' && (
+        <div>
+          <p className="text-muted mb-3" style={{ fontSize: 13 }}>
+            Attach screenshots, exports, PCAP snippets, or other files for this investigation. Files are stored on the case-service
+            volume (<code className="mono">CASE_EVIDENCE_DIR</code>); metadata is saved on the case record.
+          </p>
+          <div className="card mb-4">
+            <div className="card-title mb-2">Upload file</div>
+            <div className="flex gap-2" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+              <input
+                type="file"
+                disabled={evidenceUploading || !token}
+                onChange={(e) => {
+                  void uploadEvidence(e.target.files);
+                  e.target.value = '';
+                }}
+              />
+              {evidenceUploading && <span className="text-muted" style={{ fontSize: 13 }}>Uploading…</span>}
+              {!token && <span className="text-muted" style={{ fontSize: 13 }}>Sign in to upload.</span>}
+            </div>
+          </div>
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Size</th>
+                <th>Uploaded</th>
+                <th>By</th>
+                <th style={{ minWidth: 160 }}>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(c.evidence || []).map((ev) => (
+                <tr key={ev.id}>
+                  <td className="mono" style={{ fontSize: 12 }}>{ev.filename || ev.id}</td>
+                  <td>{formatBytes(ev.size)}</td>
+                  <td className="text-muted" style={{ fontSize: 12 }}>{relTime(ev.uploaded_at)}</td>
+                  <td className="text-muted" style={{ fontSize: 12 }}>{ev.uploaded_by || '—'}</td>
+                  <td>
+                    <div className="flex gap-1" style={{ flexWrap: 'wrap' }}>
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        style={{ fontSize: 11, padding: '4px 8px' }}
+                        onClick={() => void downloadEvidence(ev.id, ev.filename || 'download')}
+                      >
+                        Download
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-danger"
+                        style={{ fontSize: 11, padding: '4px 8px' }}
+                        onClick={() => void deleteEvidence(ev.id)}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!c.evidence?.length && (
+                <tr><td colSpan={5}><div className="empty-state">No evidence files yet.</div></td></tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -607,7 +760,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
         </div>
       )}
 
-      {toast && <div className="toast success">{toast}</div>}
+      {toast && <div className={`toast ${toastOk ? 'success' : 'error'}`}>{toast}</div>}
     </div>
   );
 }

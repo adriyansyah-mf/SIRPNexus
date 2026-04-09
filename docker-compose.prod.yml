@@ -133,6 +133,10 @@ services:
     build: ./services/case-service
     restart: always
     env_file: .env
+    environment:
+      CASE_EVIDENCE_DIR: /home/appuser/data/case-evidence
+    volumes:
+      - case_evidence:/home/appuser/data/case-evidence
     depends_on:
       postgres:
         condition: service_healthy
@@ -286,3 +290,4 @@ volumes:
   pg_data:
   es_data:
   grafana_data:
+  case_evidence:

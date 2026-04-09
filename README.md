@@ -162,6 +162,7 @@ bash infra/kafka/create-topics.sh
   - Ownership enforcement (owner/admin for status updates)
   - Case lifecycle (`open|in-progress|resolved|closed`)
   - Timeline, comments, tasks
+  - Evidence files: `POST /cases/cases/{id}/evidence` (multipart `file` + optional `uploaded_by`), download `GET …/evidence/{evidence_id}/file`, delete `DELETE …/evidence/{evidence_id}` — files on disk (`CASE_EVIDENCE_DIR`), metadata on case JSON; UI tab **Evidence** on case detail.
 
 ## Security Controls
 

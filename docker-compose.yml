@@ -71,6 +71,10 @@ services:
     build: ./services/case-service
     restart: unless-stopped
     env_file: .env
+    environment:
+      CASE_EVIDENCE_DIR: /home/appuser/data/case-evidence
+    volumes:
+      - case_evidence:/home/appuser/data/case-evidence
     depends_on: [postgres, kafka]
   observable-service:
     build: ./services/observable-service
@@ -99,3 +103,4 @@ services:
     depends_on: [api-gateway]
 volumes:
   pg_data:
+  case_evidence:

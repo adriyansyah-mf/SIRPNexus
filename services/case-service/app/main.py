@@ -1,15 +1,17 @@
 import json
 import os
+import re
 import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import asyncpg
 from aiokafka import AIOKafkaProducer
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from prometheus_fastapi_instrumentator import Instrumentator
 
@@ -21,6 +23,10 @@ KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "")
 FERNET = Fernet(DATA_ENCRYPTION_KEY.encode()) if DATA_ENCRYPTION_KEY else None
+
+EVIDENCE_DIR = Path(os.getenv("CASE_EVIDENCE_DIR", "/tmp/sirp-case-evidence")).resolve()
+MAX_EVIDENCE_BYTES = int(os.getenv("CASE_EVIDENCE_MAX_BYTES", str(25 * 1024 * 1024)))
+_UUID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", re.I)
 
 CASES: dict[str, dict[str, Any]] = {}
 
@@ -63,6 +69,31 @@ def _decrypt_case_payload(case: dict[str, Any]) -> dict[str, Any]:
 async def _emit(event: str, payload: dict[str, Any]):
     assert producer
     await producer.send_and_wait("cases.updated", json.dumps({"event": event, **payload}, default=str).encode())
+
+
+def _validate_case_id(case_id: str) -> str:
+    if not _UUID_RE.match(case_id.strip()):
+        raise HTTPException(status_code=400, detail="Invalid case id")
+    return case_id.strip()
+
+
+def _safe_filename(name: str) -> str:
+    base = Path(name or "file").name
+    base = re.sub(r"[^a-zA-Z0-9._-]", "_", base).strip("._") or "file"
+    return base[:200]
+
+
+def _evidence_base_dir(case_id: str) -> Path:
+    cid = _validate_case_id(case_id)
+    return (EVIDENCE_DIR / cid).resolve()
+
+
+def _resolved_evidence_path(case_id: str, stored_name: str) -> Path:
+    base = _evidence_base_dir(case_id)
+    path = (base / stored_name).resolve()
+    if not str(path).startswith(str(base)) or path == base:
+        raise HTTPException(status_code=400, detail="Invalid evidence path")
+    return path
 
 
 async def _persist_case(case_id: str, case: dict[str, Any]):
@@ -194,6 +225,7 @@ async def startup():
         "CREATE TABLE IF NOT EXISTS cases ("
         "id TEXT PRIMARY KEY, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
     )
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.on_event("shutdown")
@@ -289,6 +321,7 @@ def _build_case(case_id: str, title: str, description: str, severity: str = "med
         },
         "created_at": _now(),
         "updated_at": _now(),
+        "evidence": [],
     }
 
 
@@ -436,3 +469,107 @@ async def delete_task(case_id: str, task_id: str):
     CASES[case_id] = case
     await _persist_case(case_id, case)
     return {"status": "deleted", "task_id": task_id}
+
+
+@app.post("/cases/{case_id}/evidence")
+async def upload_evidence(
+    case_id: str,
+    file: UploadFile = File(...),
+    uploaded_by: str = Form(""),
+):
+    """Store one file on disk; metadata is stored on the case JSON (not file contents)."""
+    _validate_case_id(case_id)
+    case = await get_case(case_id)
+    case.setdefault("evidence", [])
+    evidence_id = str(uuid.uuid4())
+    orig_name = _safe_filename(file.filename or "upload")
+    stored_name = f"{evidence_id}_{orig_name}"
+    dest_dir = _evidence_base_dir(case_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / stored_name
+
+    total = 0
+    try:
+        with open(dest_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_EVIDENCE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds limit of {MAX_EVIDENCE_BYTES} bytes",
+                    )
+                out.write(chunk)
+    except HTTPException:
+        dest_path.unlink(missing_ok=True)
+        raise
+    except Exception:
+        dest_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Failed to store file") from None
+
+    meta = {
+        "id": evidence_id,
+        "filename": orig_name,
+        "stored_name": stored_name,
+        "size": total,
+        "content_type": (file.content_type or "application/octet-stream")[:200],
+        "uploaded_at": _now(),
+        "uploaded_by": (uploaded_by or "").strip()[:200] or None,
+    }
+    case["evidence"].append(meta)
+    case["updated_at"] = _now()
+    case["timeline"].append(
+        {"event": "evidence_uploaded", "at": _now(), "evidence_id": evidence_id, "filename": orig_name}
+    )
+    CASES[case_id] = case
+    await _persist_case(case_id, case)
+    await _emit(
+        "evidence_uploaded",
+        {"case_id": case_id, "evidence_id": evidence_id, "filename": orig_name, "size": total},
+    )
+    return meta
+
+
+@app.get("/cases/{case_id}/evidence/{evidence_id}/file")
+async def download_evidence_file(case_id: str, evidence_id: str):
+    _validate_case_id(case_id)
+    if not _UUID_RE.match(evidence_id.strip()):
+        raise HTTPException(status_code=400, detail="Invalid evidence id")
+    eid = evidence_id.strip()
+    case = await get_case(case_id)
+    case.setdefault("evidence", [])
+    meta = next((e for e in case["evidence"] if e.get("id") == eid), None)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    path = _resolved_evidence_path(case_id, str(meta["stored_name"]))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Evidence file missing on disk")
+    return FileResponse(
+        path,
+        filename=str(meta.get("filename") or "download"),
+        media_type=str(meta.get("content_type") or "application/octet-stream"),
+    )
+
+
+@app.delete("/cases/{case_id}/evidence/{evidence_id}")
+async def delete_evidence(case_id: str, evidence_id: str):
+    _validate_case_id(case_id)
+    if not _UUID_RE.match(evidence_id.strip()):
+        raise HTTPException(status_code=400, detail="Invalid evidence id")
+    eid = evidence_id.strip()
+    case = await get_case(case_id)
+    case.setdefault("evidence", [])
+    meta = next((e for e in case["evidence"] if e.get("id") == eid), None)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    path = _resolved_evidence_path(case_id, str(meta["stored_name"]))
+    if path.is_file():
+        path.unlink()
+    case["evidence"] = [e for e in case["evidence"] if e.get("id") != eid]
+    case["updated_at"] = _now()
+    case["timeline"].append({"event": "evidence_removed", "at": _now(), "evidence_id": eid})
+    CASES[case_id] = case
+    await _persist_case(case_id, case)
+    return {"status": "deleted", "evidence_id": eid}
