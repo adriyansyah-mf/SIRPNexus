@@ -1,5 +1,6 @@
 'use client';
 
+import { browserStreamEventsUrl } from '../../lib/wsUrl';
 import { useEffect, useState } from 'react';
 
 type StreamEvent = {
@@ -12,8 +13,8 @@ export default function RealtimeFeed() {
   const [events, setEvents] = useState<StreamEvent[]>([]);
 
   useEffect(() => {
-    const wsUrl = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/stream/events';
-    const ws = new WebSocket(wsUrl);
+    const token = localStorage.getItem('sirp_token') || '';
+    const ws = new WebSocket(browserStreamEventsUrl(token));
 
     ws.onmessage = (event) => {
       try {

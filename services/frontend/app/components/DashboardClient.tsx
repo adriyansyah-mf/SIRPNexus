@@ -1,5 +1,6 @@
 'use client';
 
+import { CLIENT_API_PREFIX } from '../../lib/clientApi';
 import { useCallback, useEffect, useState } from 'react';
 import LiveFeed from './LiveFeed';
 
@@ -19,8 +20,6 @@ type CaseItem = {
   status?: string;
   created_at?: string;
 };
-
-const BASE = process.env.NEXT_PUBLIC_API_GATEWAY_URL || 'http://localhost:8000';
 
 function sevBadge(sev?: string) {
   const s = (sev || 'medium').toLowerCase();
@@ -48,7 +47,7 @@ function relTime(ts?: string): string {
 async function fetchJson<T>(path: string, token: string | null): Promise<T> {
   if (!token) return [] as T;
   try {
-    const res = await fetch(`${BASE}${path}`, {
+    const res = await fetch(`${CLIENT_API_PREFIX}${path}`, {
       cache: 'no-store',
       headers: { authorization: `Bearer ${token}` },
     });

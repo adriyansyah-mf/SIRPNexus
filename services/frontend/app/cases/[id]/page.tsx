@@ -1,8 +1,7 @@
 'use client';
 
+import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
 import { useEffect, useRef, useState } from 'react';
-
-const BASE = process.env.NEXT_PUBLIC_API_GATEWAY_URL || 'http://localhost:8000';
 
 type Case = {
   id: string;
@@ -77,12 +76,16 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const load = async () => {
-    const res = await fetch(`${BASE}/cases/cases/${params.id}`, { cache: 'no-store' });
+    const h = token ? { authorization: `Bearer ${token}` } : {};
+    const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}`, { cache: 'no-store', headers: h });
     if (!res.ok) return;
     const data = await res.json();
     setC(data);
     if (data.alert_id) {
-      const r = await fetch(`${BASE}/analyzers/results?alert_id=${encodeURIComponent(data.alert_id)}`, { cache: 'no-store' });
+      const r = await fetch(
+        `${CLIENT_API_PREFIX}/analyzers/results?alert_id=${encodeURIComponent(data.alert_id)}`,
+        { cache: 'no-store', headers: h },
+      );
       if (r.ok) setResults(await r.json());
     }
   };
@@ -91,7 +94,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   const setStatus = async (status: string) => {
     const actor = token ? 'admin' : 'ui';
-    await fetch(`${BASE}/cases/cases/${params.id}/status`, {
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/status`, {
       method: 'POST', headers: authHdr,
       body: JSON.stringify({ status, actor }),
     });
@@ -102,7 +105,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const addComment = async () => {
     if (!commentText.trim()) return;
     const author = token ? 'analyst' : 'anonymous';
-    await fetch(`${BASE}/cases/cases/${params.id}/comments`, {
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments`, {
       method: 'POST', headers: authHdr,
       body: JSON.stringify({ author, text: commentText }),
     });
@@ -112,14 +115,14 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const deleteComment = async (cid: string) => {
-    await fetch(`${BASE}/cases/cases/${params.id}/comments/${cid}`, { method: 'DELETE', headers: authHdr });
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments/${cid}`, { method: 'DELETE', headers: authHdr });
     notify('Comment deleted');
     load();
   };
 
   const addTask = async () => {
     if (!taskTitle.trim()) return;
-    await fetch(`${BASE}/cases/cases/${params.id}/tasks`, {
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks`, {
       method: 'POST', headers: authHdr,
       body: JSON.stringify({ title: taskTitle, assigned_to: taskAssignee }),
     });
@@ -129,7 +132,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const updateTaskStatus = async (tid: string, status: string) => {
-    await fetch(`${BASE}/cases/cases/${params.id}/tasks/${tid}`, {
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks/${tid}`, {
       method: 'PUT', headers: authHdr,
       body: JSON.stringify({ status }),
     });
@@ -138,7 +141,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const deleteTask = async (tid: string) => {
-    await fetch(`${BASE}/cases/cases/${params.id}/tasks/${tid}`, { method: 'DELETE', headers: authHdr });
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks/${tid}`, { method: 'DELETE', headers: authHdr });
     notify('Task deleted');
     load();
   };

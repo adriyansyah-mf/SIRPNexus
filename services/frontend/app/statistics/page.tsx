@@ -1,3 +1,4 @@
+import { serverJson } from '../../lib/serverGateway';
 import UtcClock from '../components/UtcClock';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -36,19 +37,6 @@ type AnalyzerResult = {
   value?: string;
   result?: { risk?: { verdict?: string; final_score?: number } };
 };
-
-/* ── Data fetching ──────────────────────────────────────────────────────────── */
-const API = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
-
-async function getJson<T>(path: string): Promise<T> {
-  try {
-    const res = await fetch(`${API}${path}`, { cache: 'no-store' });
-    if (!res.ok) return [] as T;
-    return res.json();
-  } catch {
-    return [] as T;
-  }
-}
 
 /* ── Compute helpers ─────────────────────────────────────────────────────────── */
 function countBy<T>(items: T[], key: (item: T) => string): Record<string, number> {
@@ -198,10 +186,10 @@ function SectionCard({ title, dot, children }: { title: string; dot?: string; ch
 /* ── Page ───────────────────────────────────────────────────────────────────── */
 export default async function StatisticsPage() {
   const [alerts, cases, observables, results] = await Promise.all([
-    getJson<Alert[]>('/alerts/alerts'),
-    getJson<Case[]>('/cases/cases'),
-    getJson<Observable[]>('/observables/observables'),
-    getJson<AnalyzerResult[]>('/analyzers/results'),
+    serverJson<Alert[]>('/alerts/alerts'),
+    serverJson<Case[]>('/cases/cases'),
+    serverJson<Observable[]>('/observables/observables'),
+    serverJson<AnalyzerResult[]>('/analyzers/results'),
   ]);
 
   /* ── Alert stats ──────────────────────────────────────────────────────── */

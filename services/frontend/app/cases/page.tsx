@@ -1,4 +1,4 @@
-const BASE = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
+import { serverFetchGateway } from '../../lib/serverGateway';
 
 type Case = {
   id: string;
@@ -36,7 +36,7 @@ function relTime(ts?: string): string {
 
 async function getCases(): Promise<Case[]> {
   try {
-    const res = await fetch(`${BASE}/cases/cases`, { cache: 'no-store' });
+    const res = await serverFetchGateway('/cases/cases');
     if (!res.ok) return [];
     return res.json();
   } catch {

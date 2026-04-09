@@ -2,6 +2,11 @@
 const nextConfig = {
   reactStrictMode: true,
 
+  async rewrites() {
+    const gw = (process.env.API_GATEWAY_URL || 'http://api-gateway:8000').replace(/\/$/, '');
+    return [{ source: '/sirp-api/:path*', destination: `${gw}/:path*` }];
+  },
+
   async headers() {
     return [
       {
@@ -20,7 +25,8 @@ const nextConfig = {
               "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
               "font-src 'self' https://fonts.gstatic.com",
               "img-src 'self' data:",
-              "connect-src 'self' ws://localhost:8000 wss://localhost:8000 http://localhost:8000",
+              // Allow API proxy ('self') + WS to gateway on same host:port as browser (see NEXT_PUBLIC_GATEWAY_PORT)
+              "connect-src 'self' http: https: ws: wss:",
               "frame-ancestors 'none'",
             ].join('; '),
           },

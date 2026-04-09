@@ -1,5 +1,6 @@
 'use client';
 
+import { CLIENT_API_PREFIX } from '../../lib/clientApi';
 import { useEffect, useRef, useState } from 'react';
 
 type Alert = {
@@ -19,8 +20,6 @@ type Modal =
   | { type: 'tags'; id: string; current: string[] }
   | { type: 'status'; id: string }
   | { type: 'detail'; alert: Alert };
-
-const BASE = process.env.NEXT_PUBLIC_API_GATEWAY_URL || 'http://localhost:8000';
 
 function sevBadge(sev?: string) {
   const s = (sev || 'medium').toLowerCase();
@@ -62,7 +61,10 @@ export default function AlertsPage() {
   };
 
   const load = async () => {
-    const res = await fetch(`${BASE}/alerts/alerts`, { cache: 'no-store' });
+    const token = localStorage.getItem('sirp_token') || '';
+    const headers: Record<string, string> = {};
+    if (token) headers.authorization = `Bearer ${token}`;
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts`, { cache: 'no-store', headers });
     const data = await res.json().catch(() => []);
     setAlerts(Array.isArray(data) ? data : []);
   };
@@ -78,20 +80,20 @@ export default function AlertsPage() {
     if (token) headers['authorization'] = `Bearer ${token}`;
 
     if (modal.type === 'assign') {
-      await fetch(`${BASE}/alerts/alerts/${modal.id}/assign`, {
+      await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/assign`, {
         method: 'POST', headers,
         body: JSON.stringify({ assigned_to: modalInput, assigned_by: 'ui-admin' }),
       });
       notify(`Assigned alert to ${modalInput}`);
     } else if (modal.type === 'tags') {
       const tags = modalInput.split(',').map((t) => t.trim()).filter(Boolean);
-      await fetch(`${BASE}/alerts/alerts/${modal.id}/tags`, {
+      await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/tags`, {
         method: 'POST', headers,
         body: JSON.stringify({ tags }),
       });
       notify(`Tags updated`);
     } else if (modal.type === 'status') {
-      await fetch(`${BASE}/alerts/alerts/${modal.id}/status`, {
+      await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/status`, {
         method: 'POST', headers,
         body: JSON.stringify({ status: modalInput }),
       });
@@ -103,7 +105,7 @@ export default function AlertsPage() {
 
   const runAnalyzers = async (id: string) => {
     const token = localStorage.getItem('sirp_token') || '';
-    await fetch(`${BASE}/alerts/alerts/${id}/run-analyzers`, {
+    await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/run-analyzers`, {
       method: 'POST',
       headers: token ? { authorization: `Bearer ${token}` } : {},
     });
@@ -112,7 +114,7 @@ export default function AlertsPage() {
 
   const escalate = async (id: string) => {
     const token = localStorage.getItem('sirp_token') || '';
-    const res = await fetch(`${BASE}/alerts/alerts/${id}/escalate`, {
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/escalate`, {
       method: 'POST',
       headers: token ? { authorization: `Bearer ${token}` } : {},
     });

@@ -1,5 +1,6 @@
 'use client';
 
+import { browserStreamEventsUrl } from '../../lib/wsUrl';
 import { useEffect, useRef, useState } from 'react';
 
 type FeedEvent = {
@@ -48,9 +49,8 @@ export default function LiveFeed() {
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
-    const wsBase = process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000/stream/events';
     const token = localStorage.getItem('sirp_token') || '';
-    const url = token ? `${wsBase}?token=${encodeURIComponent(token)}` : wsBase;
+    const url = browserStreamEventsUrl(token);
 
     const connect = () => {
       const ws = new WebSocket(url);
