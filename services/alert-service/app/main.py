@@ -646,26 +646,63 @@ async def run_analyzers(alert_id: str):
     return {"status": "queued", "observable_count": len(alert.get("observables", []))}
 
 
+def _sanitize_observables(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        v = item.get("value")
+        if v is None or v == "":
+            continue
+        out.append({"type": str(item.get("type") or "other"), "value": str(v)[:800]})
+    return out
+
+
 @app.post("/alerts/{alert_id}/escalate")
 async def escalate_alert(alert_id: str):
     alert = await _get_alert_or_404(alert_id)
     if alert.get("status") == "escalated" and alert.get("case_id"):
-        return {"status": "already_escalated", "case_id": alert["case_id"]}
+        return {"status": "already_escalated", "case_id": alert["case_id"], "case": {"id": alert["case_id"]}}
+
+    title = (alert.get("title") or "").strip() or "Untitled"
+    description = alert.get("description") or alert.get("summary") or ""
+    if not isinstance(description, str):
+        description = json.dumps(description, default=str)
+    sev = str(alert.get("severity") or "medium").lower()
+    if sev not in {"low", "medium", "high", "critical"}:
+        sev = "medium"
+    tags_raw = alert.get("tags") or []
+    tags = [str(t) for t in tags_raw if t is not None][:64] if isinstance(tags_raw, list) else []
 
     case_payload = {
-        "alert_id": alert_id,
-        "title": alert.get("title"),
-        "description": alert.get("description"),
-        "observables": alert.get("observables", []),
-        "tags": alert.get("tags", []),
+        "alert_id": str(alert_id),
+        "title": title[:500],
+        "description": description[:16000],
+        "observables": _sanitize_observables(alert.get("observables")),
+        "tags": tags,
+        "severity": sev,
     }
-    case_service = os.getenv("CASE_SERVICE_URL", "http://case-service:8001")
-    headers = {}
+    case_base = os.getenv("CASE_SERVICE_URL", "http://case-service:8001").rstrip("/")
+    url = f"{case_base}/cases/from-alert"
+    headers: dict[str, str] = {"content-type": "application/json"}
     if INTERNAL_SERVICE_TOKEN:
         headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(f"{case_service}/cases/from-alert", json=case_payload, headers=headers)
-        resp.raise_for_status()
+        try:
+            resp = await client.post(url, json=case_payload, headers=headers)
+        except httpx.ConnectError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Case service unreachable at {case_base}. Check CASE_SERVICE_URL and Docker network.",
+            ) from exc
+        if resp.status_code >= 400:
+            detail = resp.text[:800] if resp.text else resp.reason_phrase
+            raise HTTPException(
+                status_code=502,
+                detail=f"Case service error {resp.status_code}: {detail}",
+            )
         case = resp.json()
 
     alert["status"] = "escalated"

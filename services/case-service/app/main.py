@@ -10,7 +10,7 @@ from aiokafka import AIOKafkaProducer
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from prometheus_fastapi_instrumentator import Instrumentator
 
 app = FastAPI(title="Case Service")
@@ -77,13 +77,69 @@ async def _persist_case(case_id: str, case: dict[str, Any]):
 
 
 class CaseFromAlert(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     alert_id: str
-    title: str
-    description: str
-    observables: list[dict[str, Any]] = []
-    tags: list[str] = []
+    title: str = "Untitled"
+    description: str = ""
+    observables: list[dict[str, Any]] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     severity: str = "medium"
     owner: str = ""
+
+    @field_validator("alert_id", mode="before")
+    @classmethod
+    def alert_id_str(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def title_ok(cls, v: Any) -> str:
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            return "Untitled"
+        return str(v).strip()[:500]
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def desc_ok(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)[:16000]
+
+    @field_validator("owner", mode="before")
+    @classmethod
+    def owner_ok(cls, v: Any) -> str:
+        return "" if v is None else str(v)[:200]
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def sev_ok(cls, v: Any) -> str:
+        s = str(v or "medium").lower()
+        return s if s in {"low", "medium", "high", "critical"} else "medium"
+
+    @field_validator("observables", mode="before")
+    @classmethod
+    def obs_ok(cls, v: Any) -> list[dict[str, Any]]:
+        if not isinstance(v, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in v:
+            if not isinstance(item, dict):
+                continue
+            val = item.get("value")
+            if val is None or val == "":
+                continue
+            out.append({"type": str(item.get("type") or "other"), "value": str(val)[:800]})
+        return out
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def tags_ok(cls, v: Any) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        return [str(x) for x in v if x is not None][:64]
 
 
 class CaseCreate(BaseModel):
@@ -166,8 +222,33 @@ async def health():
 async def list_cases():
     if db_pool:
         rows = await db_pool.fetch("SELECT payload FROM cases ORDER BY created_at DESC LIMIT 1000")
-        return [_decrypt_case_payload(dict(r["payload"])) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            p = r["payload"]
+            if isinstance(p, str):
+                try:
+                    p = json.loads(p)
+                except Exception:
+                    continue
+            if not isinstance(p, dict):
+                continue
+            out.append(_decrypt_case_payload(dict(p)))
+        return out
     return list(CASES.values())
+
+
+def _row_payload(row: asyncpg.Record | None) -> dict[str, Any] | None:
+    if not row:
+        return None
+    p = row["payload"]
+    if isinstance(p, str):
+        try:
+            p = json.loads(p)
+        except Exception:
+            return None
+    if not isinstance(p, dict):
+        return None
+    return _decrypt_case_payload(dict(p))
 
 
 @app.get("/cases/{case_id}")
@@ -175,8 +256,7 @@ async def get_case(case_id: str):
     case = CASES.get(case_id)
     if not case and db_pool:
         row = await db_pool.fetchrow("SELECT payload FROM cases WHERE id = $1", case_id)
-        if row:
-            case = _decrypt_case_payload(dict(row["payload"]))
+        case = _row_payload(row)
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
     return case

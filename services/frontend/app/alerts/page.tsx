@@ -151,7 +151,15 @@ export default function AlertsPage() {
       headers: token ? { authorization: `Bearer ${token}` } : {},
     });
     const data = await res.json().catch(() => ({}));
-    notify(data.status === 'escalated' ? `Escalated → Case ${data.case?.id?.slice(0, 8)}…` : 'Escalation failed');
+    if (data.status === 'escalated' && data.case?.id) {
+      notify(`Escalated → Case ${data.case.id.slice(0, 8)}…`);
+    } else if (data.status === 'already_escalated') {
+      const cid = data.case?.id || data.case_id || '';
+      notify(cid ? `Already linked to case ${cid.slice(0, 8)}…` : 'Alert was already escalated');
+    } else {
+      const msg = typeof data.detail === 'string' ? data.detail : (Array.isArray(data.detail) ? JSON.stringify(data.detail) : 'Escalation failed');
+      notify(res.ok ? 'Unexpected response' : `${msg} (${res.status})`);
+    }
     load();
   };
 
