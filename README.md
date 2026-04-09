@@ -134,6 +134,15 @@ bash infra/kafka/create-topics.sh
   - Publishes to Kafka (`alerts.*`, `observables.created`) like other sources
   - Can run periodic auto-sync loop when enabled
 - Per-IOC lookup (UI + API): `POST /alerts/opencti/lookup` with JSON `{"value": "<ioc>", "first": 20}` — server calls `{OPENCTI_URL}/graphql` with `stixCyberObservables(search: …)` (same token as pull).
+- When `OPENCTI_AUTO_SYNC_ENABLED=true`, set `THREAT_INTEL_PULL_SOURCE` to `opencti` (default), `abuseipdb`, or `both` to choose scheduled pull behavior.
+
+### AbuseIPDB (IP reputation)
+
+- Pull ingestion endpoint: `POST /alerts/connectors/pull/abuseipdb` (query params: `limit`, `confidence_minimum`) — fetches the AbuseIPDB blacklist and ingests each IP as an alert. Availability depends on your AbuseIPDB plan.
+- Required env: `ABUSEIPDB_API_KEY` (from [AbuseIPDB API](https://www.abuseipdb.com/api)) — same env-or-secret-service pattern as other keys.
+- Optional env: `ABUSEIPDB_API_BASE`, `ABUSEIPDB_BLACKLIST_LIMIT`, `ABUSEIPDB_CONFIDENCE_MINIMUM`.
+- Per-IP lookup (UI + API): `POST /alerts/abuseipdb/lookup` with JSON `{"value": "<ipv4-or-ipv6>", "maxAgeInDays": 90}` — server calls AbuseIPDB `GET /check`.
+- Case **Observables** tab includes a **Threat intel source** dropdown (OpenCTI vs AbuseIPDB) for the **Lookup** action; AbuseIPDB applies only to IP observables.
 
 ### Generic SIEM
 

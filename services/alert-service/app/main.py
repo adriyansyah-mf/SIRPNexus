@@ -22,6 +22,7 @@ app = FastAPI(title="Alert Service")
 Instrumentator().instrument(app).expose(app)
 
 opencti_log = logging.getLogger("sirp.opencti")
+abuseipdb_log = logging.getLogger("sirp.abuseipdb")
 
 producer: AIOKafkaProducer | None = None
 redis_client: Redis | None = None
@@ -39,6 +40,7 @@ ELASTIC_URL = os.getenv("ELASTICSEARCH_URL", "http://elasticsearch:9200")
 INGEST_ALLOWLIST = [v.strip() for v in os.getenv("INGEST_ALLOWLIST", "0.0.0.0/0").split(",")]
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 SECRET_SERVICE_URL = os.getenv("SECRET_SERVICE_URL", "http://secret-service:8001")
+ABUSEIPDB_API_BASE = os.getenv("ABUSEIPDB_API_BASE", "https://api.abuseipdb.com/api/v2").rstrip("/")
 
 
 def _now() -> str:
@@ -739,15 +741,140 @@ async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str
     }
 
 
-async def _opencti_sync_loop():
-    interval = int(os.getenv("OPENCTI_AUTO_SYNC_INTERVAL_SECONDS", "300"))
-    limit = int(os.getenv("OPENCTI_QUERY_LIMIT", "100"))
-    while True:
+async def _abuseipdb_api_key() -> str:
+    """Personal API key from AbuseIPDB account; env overrides secret-service (same rule as OpenCTI)."""
+    v = (os.getenv("ABUSEIPDB_API_KEY", "") or "").strip()
+    if v:
+        return v
+    return (await _secret_get_http_only("ABUSEIPDB_API_KEY")).strip()
+
+
+def _parse_ip_for_abuseipdb(raw: str) -> str:
+    v = (raw or "").strip()
+    if not v:
+        raise HTTPException(status_code=400, detail="value required")
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="AbuseIPDB accepts IPv4/IPv6 only (not domains, URLs, or hashes).",
+        ) from exc
+
+
+async def _abuseipdb_check_ip(ip: str, max_age_days: int) -> dict[str, Any]:
+    key = await _abuseipdb_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="AbuseIPDB not configured: set ABUSEIPDB_API_KEY (environment or secret-service).",
+        )
+    params = {"ipAddress": ip, "maxAgeInDays": max(1, min(int(max_age_days), 365))}
+    headers = {"Key": key, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=25) as client:
         try:
-            await _pull_opencti(limit=limit)
-        except Exception as exc:
-            # Keep periodic sync alive; temporary OpenCTI errors should not stop service.
-            _oc_dbg("auto-sync pull failed: %s", repr(exc)[:400])
+            resp = await client.get(f"{ABUSEIPDB_API_BASE}/check", params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"AbuseIPDB unreachable: {exc}") from exc
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if resp.status_code >= 400:
+        errs = body.get("errors") if isinstance(body, dict) else None
+        detail = (
+            json.dumps(errs, default=str)[:800]
+            if errs
+            else (resp.text or "")[:800]
+            or f"HTTP {resp.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=f"AbuseIPDB API error: {detail}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=502, detail="AbuseIPDB returned invalid JSON")
+    return {
+        "source": "abuseipdb",
+        "ip": ip,
+        "data": body.get("data"),
+        "api_errors": body.get("errors"),
+    }
+
+
+def _normalize_abuseipdb_blacklist_row(row: dict[str, Any]) -> dict[str, Any]:
+    score = int(row.get("abuseConfidenceScore") or 0)
+    sev = "critical" if score >= 75 else "high" if score >= 50 else "medium" if score >= 25 else "low"
+    ip = str(row.get("ipAddress") or "")
+    return {
+        "source": "abuseipdb",
+        "severity": sev,
+        "title": f"AbuseIPDB blacklist: {ip} (score {score})",
+        "description": (
+            f"Country: {row.get('countryCode', '')}. Last reported: {row.get('lastReportedAt', '')}"
+        )[:2000],
+        "raw": row,
+        "tags": ["abuseipdb", "blacklist", "ip"],
+    }
+
+
+async def _pull_abuseipdb_blacklist(limit: int = 100, confidence_minimum: int = 90) -> int:
+    key = await _abuseipdb_api_key()
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="ABUSEIPDB_API_KEY required for AbuseIPDB blacklist pull.",
+        )
+    lim = max(1, min(int(limit), 10_000))
+    conf = max(25, min(int(confidence_minimum), 100))
+    params = {"confidenceMinimum": conf, "limit": lim}
+    headers = {"Key": key, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=90) as client:
+        try:
+            resp = await client.get(f"{ABUSEIPDB_API_BASE}/blacklist", params=params, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"AbuseIPDB unreachable: {exc}") from exc
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    if resp.status_code >= 400:
+        errs = body.get("errors") if isinstance(body, dict) else None
+        detail = (
+            json.dumps(errs, default=str)[:800]
+            if errs
+            else (resp.text or "")[:800]
+            or f"HTTP {resp.status_code}"
+        )
+        raise HTTPException(status_code=502, detail=f"AbuseIPDB blacklist failed: {detail}")
+    rows = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        rows = []
+    ingested = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        out = await _ingest(_normalize_abuseipdb_blacklist_row(row))
+        if out.get("status") != "duplicate":
+            ingested += 1
+    abuseipdb_log.info("abuseipdb blacklist pull: rows=%d new_ingested=%d", len(rows), ingested)
+    return ingested
+
+
+async def _threat_intel_sync_loop():
+    interval = int(os.getenv("OPENCTI_AUTO_SYNC_INTERVAL_SECONDS", "300"))
+    limit_oc = int(os.getenv("OPENCTI_QUERY_LIMIT", "100"))
+    limit_abi = int(os.getenv("ABUSEIPDB_BLACKLIST_LIMIT", "100"))
+    conf_min = int(os.getenv("ABUSEIPDB_CONFIDENCE_MINIMUM", "90"))
+    src = os.getenv("THREAT_INTEL_PULL_SOURCE", "opencti").lower().strip()
+    while True:
+        if src in ("opencti", "both"):
+            try:
+                await _pull_opencti(limit=limit_oc)
+            except Exception as exc:
+                _oc_dbg("auto-sync OpenCTI pull failed: %s", repr(exc)[:400])
+        if src in ("abuseipdb", "both"):
+            try:
+                await _pull_abuseipdb_blacklist(limit=limit_abi, confidence_minimum=conf_min)
+            except Exception as exc:
+                abuseipdb_log.warning("auto-sync AbuseIPDB pull failed: %s", repr(exc)[:400])
         await asyncio.sleep(interval)
 
 
@@ -807,7 +934,7 @@ async def startup():
             opencti_log.name,
         )
     if os.getenv("OPENCTI_AUTO_SYNC_ENABLED", "false").lower() == "true":
-        opencti_sync_task = asyncio.create_task(_opencti_sync_loop())
+        opencti_sync_task = asyncio.create_task(_threat_intel_sync_loop())
 
 
 @app.on_event("shutdown")
@@ -841,6 +968,20 @@ async def opencti_lookup(body: dict[str, Any]):
     except (TypeError, ValueError):
         first = 20
     return await _opencti_graphql_lookup(str(val).strip(), first=first)
+
+
+@app.post("/abuseipdb/lookup")
+async def abuseipdb_lookup(body: dict[str, Any]):
+    """IP reputation check via AbuseIPDB GET /check (requires ABUSEIPDB_API_KEY)."""
+    val = body.get("value")
+    if val is None or str(val).strip() == "":
+        raise HTTPException(status_code=400, detail="value required")
+    try:
+        max_age = int(body.get("maxAgeInDays", 90))
+    except (TypeError, ValueError):
+        max_age = 90
+    ip = _parse_ip_for_abuseipdb(str(val))
+    return await _abuseipdb_check_ip(ip, max_age)
 
 
 @app.middleware("http")
@@ -1158,3 +1299,10 @@ async def pull_sentinel(limit: int = 100):
 async def pull_opencti(limit: int = 100):
     ingested = await _pull_opencti(limit=limit)
     return {"ingested": ingested}
+
+
+@app.post("/connectors/pull/abuseipdb")
+async def pull_abuseipdb(limit: int = 100, confidence_minimum: int = 90):
+    """Ingest AbuseIPDB blacklist into alerts (plan limits apply; often requires paid tier)."""
+    ingested = await _pull_abuseipdb_blacklist(limit=limit, confidence_minimum=confidence_minimum)
+    return {"ingested": ingested, "source": "abuseipdb"}

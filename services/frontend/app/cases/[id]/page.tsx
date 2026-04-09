@@ -33,19 +33,40 @@ type OpenctiMatch = {
   updated_at?: string;
 };
 
-type OpenctiLookupModal = {
+type IntelSource = 'opencti' | 'abuseipdb';
+
+type OpenctiLookupResult = {
+  search: string;
+  matches: OpenctiMatch[];
+  page_info?: { globalCount?: number };
+  graphql_errors?: unknown;
+  auth_hint?: string;
+};
+
+type AbuseipdbLookupResult = {
+  source?: string;
+  ip?: string;
+  data?: Record<string, unknown>;
+  api_errors?: unknown;
+};
+
+type IntelLookupModal = {
+  source: IntelSource;
   iocType: string;
   iocValue: string;
   loading: boolean;
   error: string | null;
-  result: {
-    search: string;
-    matches: OpenctiMatch[];
-    page_info?: { globalCount?: number };
-    graphql_errors?: unknown;
-    auth_hint?: string;
-  } | null;
+  opencti: OpenctiLookupResult | null;
+  abuseipdb: AbuseipdbLookupResult | null;
 };
+
+function observableSupportsAbuseIpdb(o: { type: string; value: string }): boolean {
+  if (o.type.toLowerCase() === 'ip') return true;
+  const v = o.value.trim();
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(v)) return true;
+  if (v.includes(':') && /^[0-9a-f:.]+$/i.test(v)) return true;
+  return false;
+}
 
 function sevBadge(sev?: string) {
   const s = (sev || 'medium').toLowerCase();
@@ -78,7 +99,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
   const [tab, setTab] = useState<'overview' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
-  const [openctiModal, setOpenctiModal] = useState<OpenctiLookupModal | null>(null);
+  const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
+  const [intelModal, setIntelModal] = useState<IntelLookupModal | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
@@ -100,14 +122,45 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   useEffect(() => { load(); }, [params.id]);
 
-  const lookupOpenctiGraphql = async (o: { type: string; value: string }) => {
-    setOpenctiModal({
+  const runIntelLookup = async (o: { type: string; value: string }, source: IntelSource) => {
+    setIntelModal({
+      source,
       iocType: o.type,
       iocValue: o.value,
       loading: true,
       error: null,
-      result: null,
+      opencti: null,
+      abuseipdb: null,
     });
+    if (source === 'abuseipdb') {
+      const res = await fetch(`${CLIENT_API_PREFIX}/alerts/abuseipdb/lookup`, {
+        method: 'POST',
+        headers: authHdr,
+        body: JSON.stringify({ value: o.value, maxAgeInDays: 90 }),
+      });
+      const data = (await res.json().catch(() => ({}))) as AbuseipdbLookupResult & { detail?: string };
+      if (!res.ok) {
+        const msg = typeof data.detail === 'string' ? data.detail : `AbuseIPDB lookup failed (${res.status})`;
+        setIntelModal((m) => (m ? { ...m, loading: false, error: msg } : null));
+        return;
+      }
+      setIntelModal((m) =>
+        m
+          ? {
+              ...m,
+              loading: false,
+              error: null,
+              abuseipdb: {
+                source: data.source,
+                ip: data.ip,
+                data: data.data,
+                api_errors: data.api_errors,
+              },
+            }
+          : null,
+      );
+      return;
+    }
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/opencti/lookup`, {
       method: 'POST',
       headers: authHdr,
@@ -123,16 +176,16 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     };
     if (!res.ok) {
       const msg = typeof data.detail === 'string' ? data.detail : `OpenCTI lookup failed (${res.status})`;
-      setOpenctiModal((m) => (m ? { ...m, loading: false, error: msg } : null));
+      setIntelModal((m) => (m ? { ...m, loading: false, error: msg } : null));
       return;
     }
-    setOpenctiModal((m) =>
+    setIntelModal((m) =>
       m
         ? {
             ...m,
             loading: false,
             error: null,
-            result: {
+            opencti: {
               search: data.search || o.value,
               matches: Array.isArray(data.matches) ? data.matches : [],
               page_info: data.page_info,
@@ -360,11 +413,27 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       {/* Observables */}
       {tab === 'observables' && (
         <div>
+          <div className="flex gap-3 mb-3" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+            <label className="text-muted" style={{ fontSize: 13, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>Threat intel source</span>
+              <select
+                className="mono"
+                style={{ fontSize: 13, padding: '6px 10px', borderRadius: 6 }}
+                value={intelSource}
+                onChange={(e) => setIntelSource(e.target.value as IntelSource)}
+              >
+                <option value="opencti">OpenCTI (GraphQL search)</option>
+                <option value="abuseipdb">AbuseIPDB (IP check)</option>
+              </select>
+            </label>
+          </div>
           <p className="text-muted mb-3" style={{ fontSize: 13 }}>
-            <strong>Lookup</strong> calls OpenCTI <code className="mono">POST …/graphql</code> (<code className="mono">stixCyberObservables(search: …)</code>).
-            Uses <code className="mono">OPENCTI_URL</code> + <code className="mono">OPENCTI_TOKEN</code> on alert-service (DB secrets or env).
-            {OPENCTI_URL ? (
-              <> Optional <strong>UI ↗</strong> opens the web app in a new tab.</>
+            <strong>Lookup</strong> uses the source above.
+            OpenCTI: <code className="mono">POST …/graphql</code> (<code className="mono">stixCyberObservables</code>) with
+            <code className="mono"> OPENCTI_URL</code> + token on alert-service.
+            AbuseIPDB: <code className="mono">GET /check</code> with <code className="mono">ABUSEIPDB_API_KEY</code> — IPs only.
+            {OPENCTI_URL && intelSource === 'opencti' ? (
+              <> Optional <strong>UI ↗</strong> opens OpenCTI in a new tab.</>
             ) : null}
           </p>
           <table className="data-table">
@@ -372,12 +441,14 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
               <tr>
                 <th>Type</th>
                 <th>Value</th>
-                <th style={{ minWidth: 200 }}>OpenCTI</th>
+                <th style={{ minWidth: 220 }}>Threat intel</th>
               </tr>
             </thead>
             <tbody>
               {(c.observables || []).map((o, i) => {
-                const uiHref = openctiKnowledgeSearchUrl(o.value);
+                const uiHref = intelSource === 'opencti' ? openctiKnowledgeSearchUrl(o.value) : '';
+                const abuseOk = observableSupportsAbuseIpdb(o);
+                const lookupDisabled = intelSource === 'abuseipdb' && !abuseOk;
                 return (
                   <tr key={`${i}:${o.type}:${o.value}`}>
                     <td><span className="badge badge-info">{o.type}</span></td>
@@ -388,10 +459,22 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                           type="button"
                           className="btn-primary"
                           style={{ fontSize: 12, padding: '4px 10px' }}
-                          onClick={() => void lookupOpenctiGraphql(o)}
+                          disabled={lookupDisabled}
+                          title={lookupDisabled ? 'AbuseIPDB only supports IPv4/IPv6 addresses' : undefined}
+                          onClick={() => void runIntelLookup(o, intelSource)}
                         >
                           Lookup
                         </button>
+                        {intelSource === 'abuseipdb' && abuseOk ? (
+                          <a
+                            href={`https://www.abuseipdb.com/check/${encodeURIComponent(o.value.trim())}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ fontSize: 12 }}
+                          >
+                            AbuseIPDB ↗
+                          </a>
+                        ) : null}
                         {uiHref ? (
                           <a
                             href={uiHref}
@@ -399,7 +482,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                             rel="noopener noreferrer"
                             style={{ fontSize: 12 }}
                           >
-                            UI ↗
+                            OpenCTI ↗
                           </a>
                         ) : null}
                       </div>
@@ -413,40 +496,45 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
         </div>
       )}
 
-      {openctiModal && (
-        <div className="modal-backdrop" onClick={() => setOpenctiModal(null)}>
+      {intelModal && (
+        <div className="modal-backdrop" onClick={() => setIntelModal(null)}>
           <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <div className="modal-title">
-              OpenCTI GraphQL · <span className="mono" style={{ fontWeight: 400 }}>{openctiModal.iocValue}</span>
-              <span className="badge badge-info ml-2" style={{ fontSize: 10 }}>{openctiModal.iocType}</span>
+              {intelModal.source === 'opencti' ? 'OpenCTI' : 'AbuseIPDB'} ·{' '}
+              <span className="mono" style={{ fontWeight: 400 }}>{intelModal.iocValue}</span>
+              <span className="badge badge-info ml-2" style={{ fontSize: 10 }}>{intelModal.iocType}</span>
             </div>
-            {openctiModal.loading && <div className="empty-state">Querying OpenCTI…</div>}
-            {openctiModal.error && (
-              <div className="card" style={{ padding: 12, borderColor: 'var(--sev-high)' }}>
-                <div style={{ fontSize: 13, color: 'var(--sev-high)' }}>{openctiModal.error}</div>
+            {intelModal.loading && (
+              <div className="empty-state">
+                {intelModal.source === 'opencti' ? 'Querying OpenCTI…' : 'Querying AbuseIPDB…'}
               </div>
             )}
-            {!openctiModal.loading && openctiModal.result && (
+            {intelModal.error && (
+              <div className="card" style={{ padding: 12, borderColor: 'var(--sev-high)' }}>
+                <div style={{ fontSize: 13, color: 'var(--sev-high)' }}>{intelModal.error}</div>
+              </div>
+            )}
+            {!intelModal.loading && intelModal.source === 'opencti' && intelModal.opencti && (
               <div style={{ maxHeight: '60vh', overflow: 'auto' }}>
-                {openctiModal.result.auth_hint ? (
+                {intelModal.opencti.auth_hint ? (
                   <div className="card mb-3" style={{ padding: 12, borderColor: 'var(--accent-amber)' }}>
-                    <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>{openctiModal.result.auth_hint}</div>
+                    <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>{intelModal.opencti.auth_hint}</div>
                   </div>
                 ) : null}
-                {openctiModal.result.graphql_errors ? (
+                {intelModal.opencti.graphql_errors ? (
                   <pre className="mono" style={{ fontSize: 11, color: 'var(--sev-high)', marginBottom: 12 }}>
-                    {JSON.stringify(openctiModal.result.graphql_errors, null, 2)}
+                    {JSON.stringify(intelModal.opencti.graphql_errors, null, 2)}
                   </pre>
                 ) : null}
-                {openctiModal.result.page_info?.globalCount != null && (
+                {intelModal.opencti.page_info?.globalCount != null && (
                   <div className="text-muted mb-2" style={{ fontSize: 12 }}>
-                    Global count (platform): {openctiModal.result.page_info.globalCount}
+                    Global count (platform): {intelModal.opencti.page_info.globalCount}
                   </div>
                 )}
-                {!openctiModal.result.matches.length && !openctiModal.result.graphql_errors ? (
+                {!intelModal.opencti.matches.length && !intelModal.opencti.graphql_errors ? (
                   <div className="empty-state">No matching cyber observables in OpenCTI for this search.</div>
                 ) : null}
-                {openctiModal.result.matches.length > 0 && (
+                {intelModal.opencti.matches.length > 0 && (
                   <table className="data-table">
                     <thead>
                       <tr>
@@ -456,7 +544,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                       </tr>
                     </thead>
                     <tbody>
-                      {openctiModal.result.matches.map((m, j) => (
+                      {intelModal.opencti.matches.map((m, j) => (
                         <tr key={m.id || j}>
                           <td><span className="badge badge-info">{m.entity_type || '—'}</span></td>
                           <td className="mono" style={{ maxWidth: 240 }}>{m.observable_value || '—'}</td>
@@ -466,9 +554,9 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                     </tbody>
                   </table>
                 )}
-                {openctiModal.result.matches.some((m) => m.description) ? (
+                {intelModal.opencti.matches.some((m) => m.description) ? (
                   <div style={{ marginTop: 12 }}>
-                    {openctiModal.result.matches.map((m, j) =>
+                    {intelModal.opencti.matches.map((m, j) =>
                       m.description ? (
                         <div key={`d-${m.id || j}`} className="text-muted" style={{ fontSize: 12, marginBottom: 8 }}>
                           <strong>{m.observable_value}</strong>: {m.description}
@@ -479,8 +567,41 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                 ) : null}
               </div>
             )}
+            {!intelModal.loading && intelModal.source === 'abuseipdb' && intelModal.abuseipdb && (
+              <div style={{ maxHeight: '60vh', overflow: 'auto' }}>
+                {intelModal.abuseipdb.api_errors ? (
+                  <pre className="mono" style={{ fontSize: 11, color: 'var(--sev-high)', marginBottom: 12 }}>
+                    {JSON.stringify(intelModal.abuseipdb.api_errors, null, 2)}
+                  </pre>
+                ) : null}
+                {intelModal.abuseipdb.data && typeof intelModal.abuseipdb.data === 'object' ? (
+                  <table className="data-table mb-3">
+                    <tbody>
+                      {Object.entries(intelModal.abuseipdb.data).map(([k, v]) => (
+                        <tr key={k}>
+                          <td className="mono" style={{ fontSize: 12, width: '40%', verticalAlign: 'top' }}>{k}</td>
+                          <td style={{ fontSize: 13 }}>{typeof v === 'object' ? JSON.stringify(v) : String(v)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <div className="empty-state">No reputation data returned.</div>
+                )}
+                {intelModal.abuseipdb.ip ? (
+                  <a
+                    href={`https://www.abuseipdb.com/check/${encodeURIComponent(intelModal.abuseipdb.ip)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ fontSize: 13 }}
+                  >
+                    Open on AbuseIPDB ↗
+                  </a>
+                ) : null}
+              </div>
+            )}
             <div className="modal-footer">
-              <button type="button" onClick={() => setOpenctiModal(null)}>Close</button>
+              <button type="button" onClick={() => setIntelModal(null)}>Close</button>
             </div>
           </div>
         </div>

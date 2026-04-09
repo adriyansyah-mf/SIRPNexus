@@ -25,7 +25,7 @@ const ROLE_COLORS: Record<Role, string> = {
 /* ── Secrets config ─────────────────────────────────────────────────────────── */
 const SECRET_GROUPS: { label: string; keys: string[] }[] = [
   {
-    label: 'Threat Intelligence (OpenCTI)',
+    label: 'Threat intelligence (OpenCTI & AbuseIPDB)',
     keys: [
       'OPENCTI_URL',
       'OPENCTI_TOKEN',
@@ -33,6 +33,7 @@ const SECRET_GROUPS: { label: string; keys: string[] }[] = [
       'OPENCTI_USER',
       'OPENCTI_EMAIL',
       'OPENCTI_PASSWORD',
+      'ABUSEIPDB_API_KEY',
     ],
   },
   {
