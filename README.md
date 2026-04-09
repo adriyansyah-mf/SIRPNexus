@@ -123,7 +123,7 @@ bash infra/kafka/create-topics.sh
 - Pull ingestion endpoint: `POST /alerts/connectors/pull/opencti`
 - Required env:
   - `OPENCTI_URL`
-  - `OPENCTI_TOKEN`
+  - `OPENCTI_TOKEN` (Personal Access Token from OpenCTI user profile — not a connector ID; do not prefix with `Bearer `), or `OPENCTI_API_KEY` as alias, or `OPENCTI_USER` + `OPENCTI_PASSWORD` for GraphQL `token` login
 - Optional env:
   - `OPENCTI_QUERY_LIMIT`
   - `OPENCTI_AUTO_SYNC_ENABLED` (`true|false`)

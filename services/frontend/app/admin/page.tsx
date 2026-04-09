@@ -26,7 +26,14 @@ const ROLE_COLORS: Record<Role, string> = {
 const SECRET_GROUPS: { label: string; keys: string[] }[] = [
   {
     label: 'Threat Intelligence (OpenCTI)',
-    keys: ['OPENCTI_URL', 'OPENCTI_TOKEN'],
+    keys: [
+      'OPENCTI_URL',
+      'OPENCTI_TOKEN',
+      'OPENCTI_API_KEY',
+      'OPENCTI_USER',
+      'OPENCTI_EMAIL',
+      'OPENCTI_PASSWORD',
+    ],
   },
   {
     label: 'SIEM Connectors',

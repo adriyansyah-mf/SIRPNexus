@@ -43,6 +43,7 @@ type OpenctiLookupModal = {
     matches: OpenctiMatch[];
     page_info?: { globalCount?: number };
     graphql_errors?: unknown;
+    auth_hint?: string;
   } | null;
 };
 
@@ -118,6 +119,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       matches?: OpenctiMatch[];
       page_info?: { globalCount?: number };
       graphql_errors?: unknown;
+      auth_hint?: string;
     };
     if (!res.ok) {
       const msg = typeof data.detail === 'string' ? data.detail : `OpenCTI lookup failed (${res.status})`;
@@ -135,6 +137,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
               matches: Array.isArray(data.matches) ? data.matches : [],
               page_info: data.page_info,
               graphql_errors: data.graphql_errors,
+              auth_hint: data.auth_hint,
             },
           }
         : null,
@@ -425,6 +428,11 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
             )}
             {!openctiModal.loading && openctiModal.result && (
               <div style={{ maxHeight: '60vh', overflow: 'auto' }}>
+                {openctiModal.result.auth_hint ? (
+                  <div className="card mb-3" style={{ padding: 12, borderColor: 'var(--accent-amber)' }}>
+                    <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>{openctiModal.result.auth_hint}</div>
+                  </div>
+                ) : null}
                 {openctiModal.result.graphql_errors ? (
                   <pre className="mono" style={{ fontSize: 11, color: 'var(--sev-high)', marginBottom: 12 }}>
                     {JSON.stringify(openctiModal.result.graphql_errors, null, 2)}

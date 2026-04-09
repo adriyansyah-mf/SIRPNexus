@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,6 +25,10 @@ redis_client: Redis | None = None
 es: AsyncElasticsearch | None = None
 db_pool: asyncpg.Pool | None = None
 opencti_sync_task = None
+# Short-lived JWT from email/password login (when no PAT); avoids login on every request.
+_opencti_login_jwt: str = ""
+_opencti_login_jwt_at: float = 0.0
+_OPENCTI_LOGIN_JWT_TTL_SEC = 600.0
 ALERTS: list[dict[str, Any]] = []
 
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
@@ -375,6 +380,117 @@ async def _secret_value(name: str) -> str:
     return os.getenv(name, "")
 
 
+def _opencti_normalize_pat(raw: str) -> str:
+    """Strip whitespace and a single leading 'Bearer ' so we do not send 'Bearer Bearer …'."""
+    t = (raw or "").strip()
+    if len(t) >= 7 and t[:7].lower() == "bearer ":
+        t = t[7:].strip()
+    return t
+
+
+async def _opencti_pat_from_store() -> str:
+    for key in ("OPENCTI_TOKEN", "OPENCTI_API_KEY"):
+        v = _opencti_normalize_pat(await _secret_value(key))
+        if v:
+            return v
+        v = _opencti_normalize_pat(os.getenv(key, ""))
+        if v:
+            return v
+    return ""
+
+
+OPENCTI_AUTH_HINT = (
+    "Use a Personal Access Token from OpenCTI (avatar → Profile → API / access tokens). "
+    "In secret-service store the token only under OPENCTI_TOKEN (or OPENCTI_API_KEY); do not prefix with 'Bearer '. "
+    "Connector IDs are not user tokens. Alternatively set OPENCTI_USER + OPENCTI_PASSWORD for login."
+)
+
+
+async def _opencti_resolve_bearer(base_url: str) -> str:
+    """Bearer token: PAT from secrets/env, else short-lived JWT from email/password GraphQL login."""
+    global _opencti_login_jwt, _opencti_login_jwt_at
+    pat = await _opencti_pat_from_store()
+    if pat:
+        return pat
+    now = time.monotonic()
+    if _opencti_login_jwt and (now - _opencti_login_jwt_at) < _OPENCTI_LOGIN_JWT_TTL_SEC:
+        return _opencti_login_jwt
+    email = ((await _secret_value("OPENCTI_USER")) or (await _secret_value("OPENCTI_EMAIL")) or "").strip()
+    if not email:
+        email = (os.getenv("OPENCTI_USER") or os.getenv("OPENCTI_EMAIL") or "").strip()
+    password = ((await _secret_value("OPENCTI_PASSWORD")) or os.getenv("OPENCTI_PASSWORD", "")).strip()
+    if not email or not password:
+        return ""
+    login_body: dict[str, Any] = {
+        "query": "mutation OpenctiLogin($input: UserLoginInput!) { token(input: $input) }",
+        "variables": {"input": {"email": email, "password": password}},
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            resp = await client.post(
+                f"{base_url}/graphql",
+                json=login_body,
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"OpenCTI login unreachable: {exc}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenCTI login HTTP {resp.status_code}: {resp.text[:500]}",
+        )
+    body = resp.json()
+    errs = body.get("errors")
+    if errs:
+        raise HTTPException(status_code=502, detail=f"OpenCTI login failed: {errs}")
+    tok = body.get("data", {}).get("token")
+    if not tok:
+        raise HTTPException(status_code=502, detail="OpenCTI login returned empty token")
+    jwt = _opencti_normalize_pat(str(tok))
+    _opencti_login_jwt = jwt
+    _opencti_login_jwt_at = now
+    return jwt
+
+
+async def _opencti_post_graphql(
+    base_url: str,
+    gql_payload: dict[str, Any],
+    *,
+    raise_on_graphql_error: bool = True,
+) -> dict[str, Any]:
+    bearer = await _opencti_resolve_bearer(base_url)
+    if not bearer:
+        raise HTTPException(
+            status_code=400,
+            detail=f"OpenCTI authentication missing. {OPENCTI_AUTH_HINT}",
+        )
+    headers = {"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=45) as client:
+        try:
+            resp = await client.post(f"{base_url}/graphql", json=gql_payload, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"OpenCTI unreachable: {exc}") from exc
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenCTI HTTP {resp.status_code}: {resp.text[:800]}",
+        )
+    payload = resp.json()
+    if raise_on_graphql_error:
+        errs = payload.get("errors")
+        if errs:
+            auth_fail = any(
+                isinstance(e, dict) and (e.get("extensions") or {}).get("code") == "AUTH_REQUIRED"
+                for e in errs
+            )
+            hint = f" {OPENCTI_AUTH_HINT}" if auth_fail else ""
+            raise HTTPException(
+                status_code=502,
+                detail=f"OpenCTI GraphQL error:{hint} {json.dumps(errs, default=str)[:1200]}",
+            )
+    return payload
+
+
 async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
     text = f"{normalized['title']} {normalized['description']} {normalized.get('summary', '')} {json.dumps(normalized['raw'])}"
     regex_obs = _extract_observables(text)
@@ -420,10 +536,11 @@ async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _pull_opencti(limit: int = 100) -> int:
-    base_url = (await _secret_value("OPENCTI_URL")).rstrip("/")
-    token = await _secret_value("OPENCTI_TOKEN")
-    if not base_url or not token:
-        raise HTTPException(status_code=400, detail="OpenCTI configuration missing")
+    base_url = (await _secret_value("OPENCTI_URL")).strip().rstrip("/")
+    if not base_url:
+        base_url = os.getenv("OPENCTI_URL", "").strip().rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="OpenCTI configuration missing: OPENCTI_URL")
 
     query = """
     query ListObservables($first: Int!) {
@@ -449,14 +566,10 @@ async def _pull_opencti(limit: int = 100) -> int:
     }
     """
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        resp = await client.post(
-            f"{base_url}/graphql",
-            json={"query": query, "variables": {"first": limit}},
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+    payload = await _opencti_post_graphql(
+        base_url,
+        {"query": query, "variables": {"first": limit}},
+    )
 
     edges = payload.get("data", {}).get("stixCyberObservables", {}).get("edges", [])
     ingested = 0
@@ -494,12 +607,13 @@ query OpenctiObservableLookup($search: String!, $first: Int!) {
 
 async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str, Any]:
     """Call OpenCTI GraphQL stixCyberObservables(search=...) — same /graphql as bulk pull."""
-    base_url = (await _secret_value("OPENCTI_URL")).rstrip("/")
-    token = await _secret_value("OPENCTI_TOKEN")
-    if not base_url or not token:
+    base_url = (await _secret_value("OPENCTI_URL")).strip().rstrip("/")
+    if not base_url:
+        base_url = os.getenv("OPENCTI_URL", "").strip().rstrip("/")
+    if not base_url:
         raise HTTPException(
             status_code=400,
-            detail="OpenCTI not configured: set OPENCTI_URL and OPENCTI_TOKEN (secret-service or env on alert-service)",
+            detail="OpenCTI not configured: set OPENCTI_URL (secret-service or env on alert-service)",
         )
     st = search_term.strip()
     if not st:
@@ -509,21 +623,7 @@ async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str
         "query": _OPENCTI_LOOKUP_QUERY,
         "variables": {"search": st, "first": first},
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        try:
-            resp = await client.post(
-                f"{base_url}/graphql",
-                json=gql_body,
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"OpenCTI unreachable: {exc}") from exc
-    if resp.status_code >= 400:
-        raise HTTPException(
-            status_code=502,
-            detail=f"OpenCTI HTTP {resp.status_code}: {resp.text[:800]}",
-        )
-    payload = resp.json()
+    payload = await _opencti_post_graphql(base_url, gql_body, raise_on_graphql_error=False)
     gql_errors = payload.get("errors")
     conn = (payload.get("data") or {}).get("stixCyberObservables") or {}
     edges = conn.get("edges") or []
@@ -541,11 +641,19 @@ async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str
                 "updated_at": n.get("updated_at"),
             }
         )
+    auth_hint = None
+    if gql_errors and isinstance(gql_errors, list):
+        if any(
+            isinstance(e, dict) and (e.get("extensions") or {}).get("code") == "AUTH_REQUIRED"
+            for e in gql_errors
+        ):
+            auth_hint = OPENCTI_AUTH_HINT
     return {
         "search": st,
         "matches": matches,
         "page_info": conn.get("pageInfo"),
         "graphql_errors": gql_errors,
+        "auth_hint": auth_hint,
     }
 
 
