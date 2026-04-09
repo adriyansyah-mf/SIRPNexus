@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from datetime import datetime, timezone
+from typing import Any
 
 import asyncpg
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -27,6 +28,25 @@ INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _jsonb_to_dict(raw: Any) -> dict[str, Any]:
+    """Postgres JSONB via asyncpg may be dict or a JSON string depending on driver/setup."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            decoded = json.loads(raw.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=8))
@@ -182,7 +202,7 @@ async def list_results(alert_id: str | None = None, limit: int = 200):
             "type": r["ioc_type"],
             "value": r["ioc_value"],
             "status": r["status"],
-            "result": dict(r["result_payload"]),
+            "result": _jsonb_to_dict(r["result_payload"]),
             "error": r["error"],
             "created_at": r["created_at"].isoformat(),
         }
