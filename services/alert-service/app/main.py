@@ -42,6 +42,24 @@ def _allowed(ip: str) -> bool:
     return any(ipa in ipaddress.ip_network(c, strict=False) for c in INGEST_ALLOWLIST)
 
 
+def _ingest_client_ip(request: Request) -> str:
+    """Direct TCP client (e.g. api-gateway). For /ingest via gateway, use forwarded IP when trusted."""
+    direct = request.client.host if request.client else "127.0.0.1"
+    if not INTERNAL_SERVICE_TOKEN:
+        return direct
+    if request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
+        return direct
+    raw = request.headers.get("x-sirp-ingest-client-ip") or request.headers.get("X-SIRP-Ingest-Client-IP")
+    if not raw:
+        return direct
+    candidate = raw.split(",")[0].strip()
+    try:
+        ipaddress.ip_address(candidate)
+        return candidate
+    except ValueError:
+        return direct
+
+
 _PRIVATE_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -476,7 +494,7 @@ async def escalate_alert(alert_id: str):
 
 @app.post("/alerts/webhook/{source}")
 async def webhook_ingest(source: str, request: Request):
-    client_ip = request.client.host if request.client else "127.0.0.1"
+    client_ip = _ingest_client_ip(request)
     if not _allowed(client_ip):
         raise HTTPException(status_code=403, detail="IP not allowlisted")
 

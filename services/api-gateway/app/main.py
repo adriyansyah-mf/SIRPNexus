@@ -409,8 +409,13 @@ async def ingest_external(source: str, request: Request):
     body = await request.body()
     forward_headers = {
         k: v for k, v in request.headers.items()
-        if k.lower() not in {"host", "authorization", "x-webhook-token"}
+        if k.lower()
+        not in {"host", "authorization", "x-webhook-token", "x-sirp-ingest-client-ip"}
     }
+    # Alert-service allowlist sees the gateway container IP unless we forward the real client (Wazuh).
+    client_host = request.client.host if request.client else ""
+    if client_host:
+        forward_headers["X-SIRP-Ingest-Client-IP"] = client_host
     if INTERNAL_SERVICE_TOKEN:
         forward_headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
 

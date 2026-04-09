@@ -51,4 +51,10 @@ Example (same shape as TheHive-style custom blocks):
 - **`hook_url`**: Use the full SIRP API Gateway URL. If you only set the base (e.g. `http://103.204.15.99:9000` with no path), the script **appends** `/ingest/wazuh` automatically.
 - **`api_key`**: Must match **`INBOUND_WEBHOOK_TOKEN`** in SIRP `.env`. The script sends it as header `x-webhook-token`. If `INBOUND_WEBHOOK_TOKEN` is empty, the gateway does not require the header (still restrict **`INGEST_ALLOWLIST`** on the alert-service to the Wazuh manager IP).
 
+### `INGEST_ALLOWLIST` and Docker / API Gateway
+
+Traffic is usually `Wazuh → api-gateway → alert-service`. The alert-service must allowlist the **real Wazuh manager IP**, not the gateway container. That works when **`INTERNAL_SERVICE_TOKEN`** is set in `.env` (same value for gateway and alert-service): the gateway adds `X-SIRP-Ingest-Client-IP` and the alert-service uses it for the allowlist check.
+
+If you leave **`INTERNAL_SERVICE_TOKEN` empty**, the alert-service only sees the gateway’s Docker IP — either set a shared token, or add your Docker bridge CIDR to `INGEST_ALLOWLIST` (weaker).
+
 After editing `ossec.conf`, restart the Wazuh manager.
