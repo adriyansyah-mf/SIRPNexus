@@ -29,7 +29,6 @@ type OpenctiMatch = {
   entity_type?: string;
   observable_value?: string;
   description?: string;
-  confidence?: number;
   created_at?: string;
   updated_at?: string;
 };
@@ -445,7 +444,6 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                       <tr>
                         <th>Type</th>
                         <th>Value</th>
-                        <th>Confidence</th>
                         <th className="hide-mobile">ID</th>
                       </tr>
                     </thead>
@@ -454,7 +452,6 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                         <tr key={m.id || j}>
                           <td><span className="badge badge-info">{m.entity_type || '—'}</span></td>
                           <td className="mono" style={{ maxWidth: 240 }}>{m.observable_value || '—'}</td>
-                          <td>{m.confidence != null ? String(m.confidence) : '—'}</td>
                           <td className="mono hide-mobile" style={{ fontSize: 10 }}>{m.id || '—'}</td>
                         </tr>
                       ))}

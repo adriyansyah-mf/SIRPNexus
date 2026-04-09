@@ -434,7 +434,6 @@ async def _pull_opencti(limit: int = 100) -> int:
             entity_type
             observable_value
             x_opencti_description
-            confidence
             created_at
             updated_at
             objectLabel {
@@ -481,7 +480,6 @@ query OpenctiObservableLookup($search: String!, $first: Int!) {
         entity_type
         observable_value
         x_opencti_description
-        confidence
         created_at
         updated_at
       }
@@ -539,7 +537,6 @@ async def _opencti_graphql_lookup(search_term: str, first: int = 20) -> dict[str
                 "entity_type": n.get("entity_type"),
                 "observable_value": n.get("observable_value"),
                 "description": n.get("x_opencti_description"),
-                "confidence": n.get("confidence"),
                 "created_at": n.get("created_at"),
                 "updated_at": n.get("updated_at"),
             }
