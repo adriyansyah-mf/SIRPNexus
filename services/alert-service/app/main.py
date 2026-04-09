@@ -106,17 +106,192 @@ def _extract_observables(text: str) -> list[dict[str, str]]:
     return out
 
 
+def _wazuh_split_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Wazuh JSON has rule + agent at root; decoder fields live under data.{srcip,full_log,...}."""
+    rule = dict(payload.get("rule") or {})
+    agent = dict(payload.get("agent") or {})
+    data_block = payload.get("data")
+    data_kv: dict[str, Any] = {}
+    if isinstance(data_block, dict):
+        for k, v in data_block.items():
+            if k == "rule" and isinstance(v, dict) and not rule:
+                rule = dict(v)
+            elif k == "agent" and isinstance(v, dict) and not agent:
+                agent = dict(v)
+            else:
+                data_kv[k] = v
+    return rule, agent, data_kv
+
+
+def _wazuh_full_log_text(data_kv: dict[str, Any]) -> str:
+    fl = data_kv.get("full_log")
+    if isinstance(fl, str):
+        return fl
+    if isinstance(fl, (dict, list)):
+        return json.dumps(fl, default=str)
+    return ""
+
+
+def _wazuh_tags_from_rule(rule: dict[str, Any]) -> list[str]:
+    tags = ["wazuh"]
+    groups = rule.get("groups")
+    if isinstance(groups, str):
+        groups = [groups]
+    if isinstance(groups, list):
+        for g in groups:
+            if isinstance(g, str) and g.strip():
+                g = g.strip()
+                tags.append(g if len(g) <= 48 else g[:45] + "…")
+    mitre_codes = re.findall(r"T\d{4}(?:\.\d{3})?", json.dumps(rule))
+    for c in mitre_codes[:5]:
+        if c not in tags:
+            tags.append(c)
+    # de-dupe preserve order
+    return list(dict.fromkeys(tags))[:24]
+
+
+def _wazuh_field_observables(data_kv: dict[str, Any]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(t: str, v: Any) -> None:
+        if v is None:
+            return
+        s = str(v).strip()
+        if not s or len(s) > 600:
+            return
+        key = f"{t}:{s.lower()}"
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({"type": t, "value": s})
+
+    pairs = [
+        ("srcip", "ip"), ("dstip", "ip"), ("src_ip", "ip"), ("dst_ip", "ip"),
+        ("srcport", "port"), ("dstport", "port"), ("src_port", "port"), ("dst_port", "port"),
+        ("url", "url"), ("md5", "hash"), ("sha1", "hash"), ("sha256", "hash"),
+        ("file", "file"), ("filename", "file"), ("process", "process"),
+        ("command", "command"), ("dstuser", "user"), ("srcuser", "user"), ("user", "user"),
+        ("dns_query", "domain"), ("domain", "domain"), ("hostname", "hostname"),
+        ("data_win_system_computer", "hostname"), ("status", "other"),
+    ]
+    for k, t in pairs:
+        if k in data_kv:
+            add(t, data_kv[k])
+    return out
+
+
+def _wazuh_human_summary(
+    rule: dict[str, Any],
+    agent: dict[str, Any],
+    data_kv: dict[str, Any],
+    full_log: str,
+) -> str:
+    lines: list[str] = []
+    rid = rule.get("id")
+    if rid is not None:
+        lines.append(f"Rule ID: {rid}")
+    ag_name = agent.get("name")
+    ag_ip = agent.get("ip")
+    ag_id = agent.get("id")
+    if ag_name or ag_ip or ag_id:
+        parts = [str(x) for x in [ag_name, ag_ip] if x]
+        if ag_id:
+            parts.append(f"id {ag_id}")
+        lines.append(f"Agent / endpoint: {' · '.join(parts)}")
+    # Windows / decoder message fields
+    for key in ("message", "win_message", "msg", "win_system_message"):
+        v = data_kv.get(key)
+        if isinstance(v, str) and v.strip():
+            lines.append(v.strip()[:900])
+            break
+    detail_keys = [
+        ("Destination user", "dstuser"),
+        ("Source IP", "srcip"),
+        ("Destination IP", "dstip"),
+        ("Process", "process"),
+        ("Command", "command"),
+        ("File", "file"),
+        ("URL", "url"),
+        ("MD5", "md5"),
+        ("SHA256", "sha256"),
+        ("Registry", "registry_key"),
+        ("Computer", "data_win_system_computer"),
+    ]
+    for label, key in detail_keys:
+        v = data_kv.get(key)
+        if isinstance(v, str) and v.strip():
+            lines.append(f"{label}: {v.strip()[:280]}")
+    if full_log and len("\n".join(lines)) < 80:
+        snippet = full_log.replace("\r\n", "\n").strip()[:1500]
+        if snippet:
+            lines.append("— Raw event —\n" + snippet)
+    elif full_log and len(lines) < 4:
+        snippet = full_log.replace("\r\n", "\n").strip()[:1200]
+        if snippet:
+            lines.append("— Raw event —\n" + snippet)
+    body = "\n".join(lines).strip()
+    if not body:
+        body = full_log.strip()[:2000] or json.dumps(data_kv, default=str)[:2000]
+    return body[:2800]
+
+
+def _wazuh_title(rule: dict[str, Any], data_kv: dict[str, Any], full_log: str) -> str:
+    desc = (rule.get("description") or "").strip()
+    if desc and desc.lower() not in ("wazuh alert", "local rule"):
+        return desc[:240]
+    for key in ("message", "win_message", "msg"):
+        m = data_kv.get(key)
+        if isinstance(m, str):
+            m = m.strip()
+            if len(m) > 12:
+                return m[:240]
+    if full_log:
+        for ln in full_log.splitlines():
+            s = ln.strip()
+            if len(s) > 15 and not s.startswith("<"):
+                return s[:240]
+        return full_log.strip()[:240]
+    return desc or "Wazuh alert"
+
+
 def _normalize_wazuh(payload: dict[str, Any]) -> dict[str, Any]:
-    data = payload.get("data", payload)
-    level = int(data.get("rule", {}).get("level", 5))
-    sev = "critical" if level >= 14 else "high" if level >= 10 else "medium"
+    rule, agent, data_kv = _wazuh_split_payload(payload)
+    full_log = _wazuh_full_log_text(data_kv)
+    level = int(rule.get("level") or data_kv.get("level") or 5)
+    sev = "critical" if level >= 14 else "high" if level >= 10 else "medium" if level >= 7 else "low"
+    title = _wazuh_title(rule, data_kv, full_log)
+    summary = _wazuh_human_summary(rule, agent, data_kv, full_log)
+    tags = _wazuh_tags_from_rule(rule)
+
+    text_blob = f"{title}\n{summary}\n{full_log}\n{json.dumps(data_kv, default=str)}"
+    obs = list({(o["type"], o["value"]): o for o in (_wazuh_field_observables(data_kv) + _extract_observables(text_blob))}.values())
+
+    agent_block = {
+        "id": str(agent.get("id", "") or ""),
+        "name": str(agent.get("name", "") or ""),
+        "ip": str(agent.get("ip", "") or ""),
+    }
+    rule_ref = {
+        "id": rule.get("id"),
+        "level": level,
+        "groups": rule.get("groups") if isinstance(rule.get("groups"), (list, str)) else [],
+        "description": rule.get("description"),
+    }
+    location = payload.get("location") or data_kv.get("location") or ""
+
     return {
         "source": "wazuh",
         "severity": sev,
-        "title": data.get("rule", {}).get("description", "Wazuh alert"),
-        "description": json.dumps(data)[:2000],
+        "title": title,
+        "description": summary[:2000],
+        "summary": summary,
         "raw": payload,
-        "tags": ["wazuh"],
+        "tags": tags,
+        "observables": obs,
+        "agent": agent_block,
+        "rule_ref": rule_ref,
+        "location": location,
     }
 
 
@@ -198,8 +373,20 @@ async def _secret_value(name: str) -> str:
 
 
 async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
-    text = f"{normalized['title']} {normalized['description']} {json.dumps(normalized['raw'])}"
-    normalized["observables"] = _extract_observables(text)
+    text = f"{normalized['title']} {normalized['description']} {normalized.get('summary', '')} {json.dumps(normalized['raw'])}"
+    regex_obs = _extract_observables(text)
+    existing = normalized.get("observables")
+    if isinstance(existing, list) and existing:
+        merged: dict[tuple[str | None, str | None], dict[str, str]] = {}
+        for o in existing:
+            if isinstance(o, dict) and o.get("value"):
+                merged[(o.get("type"), str(o.get("value")))] = {"type": str(o.get("type", "other")), "value": str(o["value"])}
+        for o in regex_obs:
+            k = (o.get("type"), o.get("value"))
+            merged.setdefault(k, o)
+        normalized["observables"] = list(merged.values())
+    else:
+        normalized["observables"] = regex_obs
     normalized["status"] = normalized.get("status", "new")
     ts = _now()
     normalized["ingested_at"] = ts

@@ -3,6 +3,15 @@
 import { CLIENT_API_PREFIX } from '../../lib/clientApi';
 import { useEffect, useRef, useState } from 'react';
 
+type AgentBlock = { id?: string; name?: string; ip?: string };
+type RuleRef = {
+  id?: string | number;
+  level?: number;
+  groups?: string[] | string;
+  description?: string;
+};
+type Observable = { type?: string; value?: string };
+
 type Alert = {
   id: string;
   severity?: string;
@@ -10,10 +19,33 @@ type Alert = {
   status?: string;
   title?: string;
   description?: string;
+  summary?: string;
   tags?: string[];
   assigned_to?: string;
   created_at?: string;
+  agent?: AgentBlock;
+  rule_ref?: RuleRef;
+  location?: string;
+  observables?: Observable[];
+  raw?: unknown;
 };
+
+function agentLine(a?: AgentBlock): string {
+  if (!a) return '';
+  const parts: string[] = [];
+  if (a.name) parts.push(String(a.name));
+  if (a.ip) parts.push(String(a.ip));
+  if (a.id !== undefined && a.id !== '') parts.push(`#${a.id}`);
+  return parts.join(' · ');
+}
+
+function ruleMeta(a: Alert): string {
+  const r = a.rule_ref;
+  const bits: string[] = [];
+  if (r?.id !== undefined && r.id !== '') bits.push(`rule ${r.id}`);
+  if (a.location) bits.push(a.location);
+  return bits.join(' · ');
+}
 
 type Modal =
   | { type: 'assign'; id: string }
@@ -128,10 +160,20 @@ export default function AlertsPage() {
     if (statusFilter !== 'all' && a.status?.toLowerCase() !== statusFilter) return false;
     if (filter) {
       const q = filter.toLowerCase();
+      const obsHit = (a.observables || []).some(
+        (o) =>
+          (o.value || '').toLowerCase().includes(q) ||
+          (o.type || '').toLowerCase().includes(q),
+      );
       return (
         (a.title || '').toLowerCase().includes(q) ||
         (a.source || '').toLowerCase().includes(q) ||
-        (a.id || '').toLowerCase().includes(q)
+        (a.id || '').toLowerCase().includes(q) ||
+        (a.summary || '').toLowerCase().includes(q) ||
+        (a.description || '').toLowerCase().includes(q) ||
+        agentLine(a.agent).toLowerCase().includes(q) ||
+        (a.location || '').toLowerCase().includes(q) ||
+        obsHit
       );
     }
     return true;
@@ -153,7 +195,7 @@ export default function AlertsPage() {
       {/* Filters */}
       <div className="flex gap-2 mb-4" style={{ flexWrap: 'wrap' }}>
         <input
-          placeholder="Search title, source, ID…"
+          placeholder="Search title, agent, IOC, rule, location…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           style={{ minWidth: 220 }}
@@ -180,6 +222,8 @@ export default function AlertsPage() {
           <tr>
             <th style={{ width: 14 }}></th>
             <th>Title</th>
+            <th className="hide-mobile">Endpoint</th>
+            <th className="hide-mobile">IOCs</th>
             <th>Severity</th>
             <th className="hide-mobile">Source</th>
             <th>Status</th>
@@ -199,11 +243,32 @@ export default function AlertsPage() {
                 >
                   {a.title || 'Untitled'}
                 </button>
+                {ruleMeta(a) ? <div className="alert-title-sub mono">{ruleMeta(a)}</div> : null}
                 {a.tags?.length ? (
                   <div className="tag-list mt-1">
-                    {a.tags.slice(0, 3).map((t) => <span className="tag" key={t}>{t}</span>)}
+                    {a.tags.slice(0, 4).map((t) => <span className="tag" key={t}>{t}</span>)}
                   </div>
                 ) : null}
+              </td>
+              <td className="text-muted hide-mobile" style={{ fontSize: 12, maxWidth: 160 }} title={agentLine(a.agent)}>
+                {agentLine(a.agent) || '—'}
+              </td>
+              <td className="hide-mobile">
+                {(a.observables || []).length ? (
+                  <div className="obs-chips" style={{ maxWidth: 200 }}>
+                    {a.observables!.slice(0, 3).map((o, i) => (
+                      <span className="obs-chip" key={`${o.type}-${i}`} title={o.value}>
+                        <span className="obs-chip-type">{o.type || '?'}</span>
+                        <span className="truncate" style={{ maxWidth: 100 }}>{o.value}</span>
+                      </span>
+                    ))}
+                    {(a.observables!.length > 3) ? (
+                      <span className="text-muted" style={{ fontSize: 11 }}>+{a.observables!.length - 3}</span>
+                    ) : null}
+                  </div>
+                ) : (
+                  <span className="text-muted">—</span>
+                )}
               </td>
               <td>{sevBadge(a.severity)}</td>
               <td className="text-muted hide-mobile">{a.source || '—'}</td>
@@ -222,7 +287,7 @@ export default function AlertsPage() {
             </tr>
           ))}
           {!filtered.length && (
-            <tr><td colSpan={8}><div className="empty-state">No alerts match your filters.</div></td></tr>
+            <tr><td colSpan={10}><div className="empty-state">No alerts match your filters.</div></td></tr>
           )}
         </tbody>
       </table>
@@ -273,27 +338,116 @@ export default function AlertsPage() {
 
       {modal && modal.type === 'detail' && (
         <div className="modal-backdrop" onClick={closeModal}>
-          <div className="modal" style={{ maxWidth: 600, width: '92vw' }} onClick={(e) => e.stopPropagation()}>
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <div className="modal-title">{modal.alert.title || 'Untitled Alert'}</div>
-            <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
-              <tbody>
-                {[
-                  ['ID', <span className="mono">{modal.alert.id}</span>],
-                  ['Severity', sevBadge(modal.alert.severity)],
-                  ['Status', statusBadge(modal.alert.status)],
-                  ['Source', modal.alert.source || '—'],
-                  ['Assigned to', modal.alert.assigned_to || '—'],
-                  ['Ingested', modal.alert.created_at || '—'],
-                  ['Tags', (modal.alert.tags || []).join(', ') || '—'],
-                  ['Description', modal.alert.description || '—'],
-                ].map(([k, v]) => (
-                  <tr key={String(k)}>
-                    <td style={{ color: 'var(--text-muted)', padding: '5px 0', width: 120, verticalAlign: 'top' }}>{k}</td>
-                    <td style={{ padding: '5px 0' }}>{v}</td>
-                  </tr>
+
+            <div className="alert-detail-section">
+              <h4>Case-style summary</h4>
+              <dl className="alert-detail-kv">
+                <dt>Alert ID</dt>
+                <dd className="mono" style={{ fontSize: 12 }}>{modal.alert.id}</dd>
+                <dt>Severity</dt>
+                <dd>{sevBadge(modal.alert.severity)}</dd>
+                <dt>Status</dt>
+                <dd>{statusBadge(modal.alert.status)}</dd>
+                <dt>Source</dt>
+                <dd>{modal.alert.source || '—'}</dd>
+                <dt>Assigned</dt>
+                <dd>{modal.alert.assigned_to || '—'}</dd>
+                <dt>Ingested</dt>
+                <dd className="mono" style={{ fontSize: 12 }}>{modal.alert.created_at || '—'}</dd>
+              </dl>
+            </div>
+
+            <div className="alert-detail-section">
+              <h4>Endpoint (agent)</h4>
+              <p style={{ margin: 0, fontSize: 13, color: 'var(--text-secondary)' }}>
+                {agentLine(modal.alert.agent) || '—'}
+                {modal.alert.location ? (
+                  <span className="text-muted" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
+                    Log location: {modal.alert.location}
+                  </span>
+                ) : null}
+              </p>
+            </div>
+
+            <div className="alert-detail-section">
+              <h4>Rule / detection</h4>
+              <dl className="alert-detail-kv">
+                <dt>Rule ID</dt>
+                <dd>{modal.alert.rule_ref?.id ?? '—'}</dd>
+                <dt>Level</dt>
+                <dd>{modal.alert.rule_ref?.level ?? '—'}</dd>
+                <dt>Groups</dt>
+                <dd>
+                  {Array.isArray(modal.alert.rule_ref?.groups)
+                    ? (modal.alert.rule_ref!.groups as string[]).join(', ')
+                    : (modal.alert.rule_ref?.groups as string) || '—'}
+                </dd>
+              </dl>
+            </div>
+
+            <div className="alert-detail-section">
+              <h4>Description</h4>
+              <div className="alert-summary">
+                {(modal.alert.summary || modal.alert.description || '—').trim()}
+              </div>
+            </div>
+
+            <div className="alert-detail-section">
+              <h4>Observables (auto-extracted IOCs)</h4>
+              {(modal.alert.observables || []).length ? (
+                <div className="obs-chips">
+                  {(modal.alert.observables || []).map((o, i) => (
+                    <span className="obs-chip" key={`${o.type}-${i}-${o.value}`} title={o.value}>
+                      <span className="obs-chip-type">{o.type || 'other'}</span>
+                      <span style={{ wordBreak: 'break-all' }}>{o.value}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-muted" style={{ fontSize: 13 }}>No IOCs extracted yet.</span>
+              )}
+            </div>
+
+            <div className="alert-detail-section">
+              <h4>Tags</h4>
+              <div className="tag-list">
+                {(modal.alert.tags || []).map((t) => (
+                  <span className="tag" key={t}>{t}</span>
                 ))}
-              </tbody>
-            </table>
+                {!(modal.alert.tags || []).length ? <span className="text-muted">—</span> : null}
+              </div>
+            </div>
+
+            <details style={{ marginTop: 8 }}>
+              <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-muted)' }}>Raw JSON (full payload)</summary>
+              <pre
+                className="mono"
+                style={{
+                  marginTop: 8,
+                  fontSize: 11,
+                  maxHeight: 240,
+                  overflow: 'auto',
+                  padding: 10,
+                  background: 'var(--bg-base)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: 6,
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                }}
+              >
+                {(() => {
+                  try {
+                    const raw = JSON.stringify(modal.alert.raw ?? modal.alert, null, 2);
+                    return raw.length > 12000 ? `${raw.slice(0, 12000)}\n… (truncated)` : raw;
+                  } catch {
+                    return String(modal.alert.raw);
+                  }
+                })()}
+              </pre>
+            </details>
+
             <div className="modal-footer">
               <button onClick={closeModal}>Close</button>
             </div>
