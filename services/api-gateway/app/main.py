@@ -170,27 +170,47 @@ def _sign_token(username: str, role: str) -> str:
 
 
 def _decode_token(token: str) -> dict:
-    # 1) Local HS256
+    """HS256 (local /auth/login) by default; RS256 + JWKS only when token alg is RS256 and OIDC_ISSUER is set."""
     try:
-        claims = jwt.decode(token, APP_AUTH_JWT_SECRET, algorithms=["HS256"], audience=AUDIENCE)
+        header = jwt.get_unverified_header(token)
+        alg = (header.get("alg") or "").upper()
+    except Exception:
+        alg = ""
+
+    issuer = OIDC_ISSUER.rstrip("/") if OIDC_ISSUER else ""
+
+    if alg == "RS256" and issuer:
+        jwks_url = f"{issuer}/protocol/openid-connect/certs"
+        try:
+            with httpx.Client(timeout=10) as client:
+                resp = client.get(jwks_url)
+                resp.raise_for_status()
+                jwks = resp.json()
+        except httpx.ConnectError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="OIDC issuer unreachable — use local login tokens only, or fix KEYCLOAK_ISSUER / network",
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=503, detail="OIDC JWKS request failed") from exc
+        key = next((k for k in jwks.get("keys", []) if k.get("kid") == header.get("kid")), None)
+        if not key:
+            raise HTTPException(status_code=401, detail="Token key mismatch")
+        try:
+            claims = jwt.decode(token, key, algorithms=["RS256"], audience=AUDIENCE, issuer=issuer)
+        except JWTError as exc:
+            raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
         if "realm_access" not in claims and "roles" in claims:
             claims["realm_access"] = {"roles": claims["roles"]}
         return claims
-    except JWTError:
-        pass
 
-    # 2) Keycloak OIDC fallback
-    if OIDC_ISSUER:
-        jwks_url = f"{OIDC_ISSUER}/protocol/openid-connect/certs"
-        with httpx.Client(timeout=10) as client:
-            jwks = client.get(jwks_url).json()
-        header = jwt.get_unverified_header(token)
-        key = next((k for k in jwks["keys"] if k["kid"] == header.get("kid")), None)
-        if not key:
-            raise HTTPException(status_code=401, detail="Token key mismatch")
-        return jwt.decode(token, key, algorithms=["RS256"], audience=AUDIENCE, issuer=OIDC_ISSUER)
-
-    raise HTTPException(status_code=401, detail="Invalid or expired token")
+    try:
+        claims = jwt.decode(token, APP_AUTH_JWT_SECRET, algorithms=["HS256"], audience=AUDIENCE)
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
+    if "realm_access" not in claims and "roles" in claims:
+        claims["realm_access"] = {"roles": claims["roles"]}
+    return claims
 
 
 def _require_role(claims: dict, allowed: set[str]) -> None:
@@ -209,10 +229,7 @@ def _require_admin_from_request(request: Request) -> dict:
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
-    try:
-        claims = _decode_token(auth.split(" ", 1)[1])
-    except JWTError as exc:
-        raise HTTPException(status_code=401, detail=f"JWT invalid: {exc}")
+    claims = _decode_token(auth.split(" ", 1)[1])
     _require_role(claims, {"admin"})
     return claims
 
@@ -386,7 +403,7 @@ async def delete_user(username: str, request: Request):
     return {"username": username, "status": "deleted"}
 
 
-# ── Inbound webhook (rate-limited) ────────────────────────────────────────────
+# ── Inbound SIEM ingest (no gateway rate limit; token + alert-service allowlist) ─
 def _validate_webhook_token(request: Request) -> None:
     provided = request.headers.get("x-webhook-token", "")
     auth = request.headers.get("authorization", "")
@@ -398,7 +415,7 @@ def _validate_webhook_token(request: Request) -> None:
 
 
 @app.post("/ingest/{source}")
-@limiter.limit("60/minute")
+@limiter.exempt
 async def ingest_external(source: str, request: Request):
     if source not in {"wazuh", "splunk", "generic"}:
         raise HTTPException(status_code=400, detail="Unsupported ingest source")
@@ -486,19 +503,16 @@ async def proxy(service: str, path: str, request: Request):
         raise HTTPException(status_code=401, detail="Authorization required")
 
     if auth.startswith("Bearer "):
-        try:
-            claims = _decode_token(auth.split(" ", 1)[1])
-            # readonly can read alerts + observables; analyst/responder/admin can mutate
-            if service in {"alerts", "observables"}:
-                _require_role(claims, {"analyst", "responder", "admin", "readonly"})
-                if request.method not in {"GET", "HEAD", "OPTIONS"} and not _require_role_soft(claims, {"analyst", "responder", "admin"}):
-                    raise HTTPException(status_code=403, detail="Write access requires analyst role or above")
-            if service in {"cases", "analyzers", "automation", "notifications"}:
-                _require_role(claims, {"analyst", "responder", "admin", "readonly"})
-            if service == "secrets":
-                _require_role(claims, {"admin"})
-        except JWTError as exc:
-            raise HTTPException(status_code=401, detail=f"JWT invalid: {exc}")
+        claims = _decode_token(auth.split(" ", 1)[1])
+        # readonly can read alerts + observables; analyst/responder/admin can mutate
+        if service in {"alerts", "observables"}:
+            _require_role(claims, {"analyst", "responder", "admin", "readonly"})
+            if request.method not in {"GET", "HEAD", "OPTIONS"} and not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+                raise HTTPException(status_code=403, detail="Write access requires analyst role or above")
+        if service in {"cases", "analyzers", "automation", "notifications"}:
+            _require_role(claims, {"analyst", "responder", "admin", "readonly"})
+        if service == "secrets":
+            _require_role(claims, {"admin"})
 
     body = await request.body()
     url = urljoin(f"{target.rstrip('/')}/", path)
