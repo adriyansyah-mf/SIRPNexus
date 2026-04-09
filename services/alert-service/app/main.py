@@ -483,12 +483,31 @@ async def _opencti_sync_loop():
         await asyncio.sleep(interval)
 
 
+def _alert_payload_from_db(raw: Any) -> dict[str, Any] | None:
+    """JSONB from Postgres may be dict or (with some setups) a JSON string."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return dict(decoded) if isinstance(decoded, dict) else None
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            decoded = json.loads(raw.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        return dict(decoded) if isinstance(decoded, dict) else None
+    return None
+
+
 async def _get_alert_or_404(alert_id: str) -> dict[str, Any]:
     alert = next((a for a in ALERTS if a.get("id") == alert_id), None)
     if not alert and db_pool:
         row = await db_pool.fetchrow("SELECT payload FROM alerts WHERE id = $1", alert_id)
         if row:
-            alert = dict(row["payload"])
+            alert = _alert_payload_from_db(row["payload"])
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
     return alert
