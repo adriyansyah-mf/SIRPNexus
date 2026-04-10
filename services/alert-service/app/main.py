@@ -1032,6 +1032,52 @@ async def enforce_internal_token(request: Request, call_next):
     return await call_next(request)
 
 
+@app.get("/alerts/siem-retro-search")
+async def siem_retro_search(q: str, size: int = 40, index: str | None = None):
+    """Full-text retro-hunt against Elasticsearch (e.g. Wazuh / ECS indices)."""
+    if es is None:
+        raise HTTPException(status_code=503, detail="Elasticsearch not available")
+    qn = (q or "").strip()
+    if len(qn) < 2:
+        raise HTTPException(status_code=400, detail="q must be at least 2 characters")
+    sz = max(1, min(int(size), 100))
+    idx = (index or os.getenv("ELASTIC_SIEM_INDEX", "wazuh-alerts-*")).strip() or "wazuh-alerts-*"
+    try:
+        resp = await es.search(
+            index=idx,
+            size=sz,
+            query={"simple_query_string": {"query": qn, "fields": ["*"], "default_operator": "or"}},
+            sort=[{"@timestamp": {"order": "desc"}}],
+        )
+    except Exception as exc:
+        err = str(exc)[:240]
+        return {"index": idx, "query": qn, "hits": [], "error": err, "note": "ES query failed — check index pattern ELASTIC_SIEM_INDEX"}
+    hits_out: list[dict[str, Any]] = []
+    for h in resp.get("hits", {}).get("hits", []) or []:
+        src = h.get("_source") if isinstance(h.get("_source"), dict) else {}
+        msg = None
+        if isinstance(src.get("rule"), dict):
+            msg = src["rule"].get("description")
+        if msg is None:
+            msg = src.get("full_log") or src.get("message")
+        if msg is None:
+            msg = str(src.get("data", ""))[:400]
+        hits_out.append(
+            {
+                "_id": h.get("_id"),
+                "_index": h.get("_index"),
+                "@timestamp": src.get("@timestamp"),
+                "summary": str(msg or "")[:500],
+            }
+        )
+    total = resp.get("hits", {}).get("total", {})
+    if isinstance(total, dict):
+        total_v = total.get("value", len(hits_out))
+    else:
+        total_v = total
+    return {"index": idx, "query": qn, "total": total_v, "hits": hits_out}
+
+
 @app.get("/alerts/{alert_id}")
 async def get_alert(alert_id: str):
     return await _get_alert_or_404(alert_id)

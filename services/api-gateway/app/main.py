@@ -190,6 +190,111 @@ async def _get_pool() -> asyncpg.Pool:
         await _user_pool.execute(
             "CREATE INDEX IF NOT EXISTS sirp_ops_snapshots_created_idx ON sirp_ops_snapshots (created_at DESC)"
         )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_chain_of_custody (
+                id BIGSERIAL PRIMARY KEY,
+                at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                case_id TEXT,
+                evidence_id TEXT,
+                detail JSONB
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_custody_case_idx ON sirp_chain_of_custody (case_id, at DESC)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_shift_reports (
+                id UUID PRIMARY KEY,
+                author TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                case_refs JSONB,
+                alert_refs JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_shift_reports_at_idx ON sirp_shift_reports (created_at DESC)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_case_watchers (
+                case_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (case_id, username)
+            )
+            """
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_playbook_run_requests (
+                id UUID PRIMARY KEY,
+                playbook_id TEXT NOT NULL,
+                requester TEXT NOT NULL,
+                case_id TEXT,
+                event_payload JSONB,
+                status TEXT NOT NULL DEFAULT 'pending',
+                approver TEXT,
+                resolution_note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                resolved_at TIMESTAMPTZ
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_pb_req_status_idx ON sirp_playbook_run_requests (status, created_at DESC)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_mention_events (
+                id BIGSERIAL PRIMARY KEY,
+                at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                case_id TEXT NOT NULL,
+                comment_id TEXT NOT NULL,
+                author TEXT NOT NULL,
+                mentioned_username TEXT NOT NULL,
+                excerpt TEXT
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS sirp_mention_unique_idx ON sirp_mention_events "
+            "(case_id, comment_id, mentioned_username)"
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_mention_user_idx ON sirp_mention_events (mentioned_username, at DESC)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_entity_edges (
+                src_kind TEXT NOT NULL,
+                src_id TEXT NOT NULL,
+                dst_kind TEXT NOT NULL,
+                dst_id TEXT NOT NULL,
+                rel TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (src_kind, src_id, dst_kind, dst_id, rel)
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_edges_dst_idx ON sirp_entity_edges (dst_kind, dst_id)"
+        )
+        await _user_pool.execute(
+            "ALTER TABLE sirp_playbook_run_requests ADD COLUMN IF NOT EXISTS approval_chain JSONB"
+        )
+        await _user_pool.execute(
+            "ALTER TABLE sirp_playbook_run_requests ADD COLUMN IF NOT EXISTS current_step INT NOT NULL DEFAULT 0"
+        )
+        await _user_pool.execute(
+            "ALTER TABLE sirp_playbook_run_requests ADD COLUMN IF NOT EXISTS step_approvals JSONB DEFAULT '[]'::jsonb"
+        )
         existing = await _user_pool.fetchval("SELECT count(*) FROM sirp_users")
         if existing == 0:
             admin_user = os.getenv("INITIAL_ADMIN_USERNAME", "admin")
@@ -806,6 +911,100 @@ def _soc_auth_user(request: Request) -> str:
     return user
 
 
+def _upstream_headers() -> dict[str, str]:
+    h: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        h["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+    return h
+
+
+def _require_internal_token(request: Request) -> None:
+    if not INTERNAL_SERVICE_TOKEN or request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
+        raise HTTPException(status_code=401, detail="Internal service authentication required")
+
+
+async def _investigation_graph_payload(
+    client: httpx.AsyncClient,
+    *,
+    case_id: str | None = None,
+    alert_id: str | None = None,
+) -> dict[str, Any]:
+    ih = _upstream_headers()
+    base_c = SERVICE_MAP["cases"].rstrip("/")
+    base_a = SERVICE_MAP["alerts"].rstrip("/")
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+
+    def add_obs_nodes(container_id: str, observables: Any, rel: str) -> None:
+        if not isinstance(observables, list):
+            return
+        for ob in observables:
+            if not isinstance(ob, dict):
+                continue
+            ov = str(ob.get("value") or "")[:96]
+            ot = str(ob.get("type") or "?")
+            oid = f"obs:{ot}:{ov}"
+            if not any(n["id"] == oid for n in nodes):
+                nodes.append({"id": oid, "kind": "observable", "label": f"{ot}:{ov}"[:80]})
+            edges.append({"from": container_id, "to": oid, "rel": rel})
+
+    if case_id:
+        cr = await client.get(f"{base_c}/cases/{case_id}", headers=ih)
+        if cr.status_code != 200:
+            raise HTTPException(status_code=cr.status_code, detail="Case not found upstream")
+        case = cr.json()
+        if not isinstance(case, dict):
+            raise HTTPException(status_code=502, detail="Invalid case payload")
+        cid = f"case:{case['id']}"
+        nodes.append({"id": cid, "kind": "case", "label": str(case.get("title") or case_id)[:80]})
+        aid = case.get("alert_id")
+        if aid:
+            ar = await client.get(f"{base_a}/alerts/{aid}", headers=ih)
+            if ar.status_code == 200 and isinstance(ar.json(), dict):
+                alert = ar.json()
+                nid = f"alert:{aid}"
+                nodes.append({"id": nid, "kind": "alert", "label": str(alert.get("title") or aid)[:80]})
+                edges.append({"from": cid, "to": nid, "rel": "source_alert"})
+                add_obs_nodes(nid, alert.get("observables"), "has_observable")
+        add_obs_nodes(cid, case.get("observables"), "case_observable")
+        for lk in case.get("linked_case_ids") or []:
+            lid = str(lk)
+            lr = await client.get(f"{base_c}/cases/{lid}", headers=ih)
+            title = lid[:12] + "…"
+            if lr.status_code == 200 and isinstance(lr.json(), dict):
+                title = str(lr.json().get("title") or lid)[:80]
+            node_id = f"case:{lid}"
+            nodes.append({"id": node_id, "kind": "case", "label": title})
+            edges.append({"from": cid, "to": node_id, "rel": "linked_case"})
+
+    elif alert_id:
+        ar = await client.get(f"{base_a}/alerts/{alert_id}", headers=ih)
+        if ar.status_code != 200:
+            raise HTTPException(status_code=ar.status_code, detail="Alert not found upstream")
+        alert = ar.json()
+        if not isinstance(alert, dict):
+            raise HTTPException(status_code=502, detail="Invalid alert payload")
+        nid = f"alert:{alert_id}"
+        nodes.append({"id": nid, "kind": "alert", "label": str(alert.get("title") or alert_id)[:80]})
+        add_obs_nodes(nid, alert.get("observables"), "has_observable")
+        cr_all = await client.get(f"{base_c}/cases", headers=ih)
+        if cr_all.status_code == 200 and isinstance(cr_all.json(), list):
+            for c in cr_all.json():
+                if not isinstance(c, dict):
+                    continue
+                if str(c.get("alert_id")) != str(alert_id):
+                    continue
+                cid = f"case:{c['id']}"
+                nodes.append({"id": cid, "kind": "case", "label": str(c.get("title") or c["id"])[:80]})
+                edges.append({"from": nid, "to": cid, "rel": "escalated_to"})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
 @app.get("/soc/hunting/queries")
 async def list_saved_hunts(request: Request):
     """Per-user saved hunt queries (persisted in gateway Postgres)."""
@@ -963,6 +1162,913 @@ async def soc_ops_history(request: Request, limit: int = 40):
     return {"items": items}
 
 
+@app.get("/soc/notification-delivery-status")
+async def soc_notification_delivery_status(request: Request):
+    """Which outbound notification channels have secrets configured (keys only, no values)."""
+    _soc_auth_user(request)
+    base = SERVICE_MAP["secrets"].rstrip("/")
+    headers: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(f"{base}/secrets", headers=headers)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:120], "channels": {}}
+    if r.status_code != 200:
+        return {"ok": False, "error": f"secrets_http_{r.status_code}", "channels": {}}
+    try:
+        rows = r.json()
+    except Exception:
+        rows = []
+    keyset: set[str] = set()
+    if isinstance(rows, list):
+        for x in rows:
+            if isinstance(x, dict) and x.get("key"):
+                keyset.add(str(x["key"]))
+    need_email = {"SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD", "NOTIFY_EMAIL_TO"}
+    channels = {
+        "email": {"configured": bool(need_email <= keyset)},
+        "slack": {"configured": "SLACK_WEBHOOK_URL" in keyset},
+        "discord": {"configured": "DISCORD_WEBHOOK_URL" in keyset},
+    }
+    return {"ok": True, "channels": channels}
+
+
+@app.post("/soc/internal/mentions/ingest")
+async def soc_internal_mentions_ingest(request: Request):
+    _require_internal_token(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    case_id = str((body or {}).get("case_id") or "").strip()[:80]
+    comment_id = str((body or {}).get("comment_id") or "").strip()[:80]
+    author = str((body or {}).get("author") or "").strip()[:200]
+    excerpt = str((body or {}).get("excerpt") or "").strip()[:800]
+    title = str((body or {}).get("case_title") or "").strip()[:300]
+    users = (body or {}).get("mentioned_users") or []
+    if not isinstance(users, list):
+        users = []
+    users = [str(u).strip()[:80] for u in users if str(u).strip()][:40]
+    if not case_id or not comment_id or not users:
+        raise HTTPException(status_code=400, detail="case_id, comment_id, mentioned_users required")
+    pool = await _get_pool()
+    for u in users:
+        await pool.execute(
+            "INSERT INTO sirp_mention_events(case_id, comment_id, author, mentioned_username, excerpt) "
+            "VALUES($1,$2,$3,$4,$5) ON CONFLICT (case_id, comment_id, mentioned_username) DO NOTHING",
+            case_id,
+            comment_id,
+            author,
+            u,
+            excerpt,
+        )
+    base_n = SERVICE_MAP["notifications"].rstrip("/")
+    ih = _upstream_headers()
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{base_n}/notifications/mentions",
+            headers=ih,
+            json={
+                "mentioned_users": users,
+                "case_id": case_id,
+                "author": author,
+                "excerpt": excerpt,
+                "case_title": title,
+                "comment_id": comment_id,
+            },
+        )
+    return {"status": "ingested", "count": len(users)}
+
+
+@app.post("/soc/internal/watchers/notify")
+async def soc_internal_watchers_notify(request: Request):
+    _require_internal_token(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    case_id = str((body or {}).get("case_id") or "").strip()[:80]
+    event = str((body or {}).get("event") or "update").strip()[:80]
+    summary = str((body or {}).get("summary") or "").strip()[:500]
+    actor = str((body or {}).get("actor") or "").strip()[:200]
+    if not case_id:
+        raise HTTPException(status_code=400, detail="case_id required")
+    pool = await _get_pool()
+    rows = await pool.fetch("SELECT username FROM sirp_case_watchers WHERE case_id = $1", case_id)
+    if not rows:
+        return {"notified": 0}
+    watchers = [r["username"] for r in rows]
+    line = (
+        f"SIRP case watch · {case_id}\nEvent: {event}\nActor: {actor}\nWatchers: {', '.join(watchers)}\n{summary}"
+    )
+    base_n = SERVICE_MAP["notifications"].rstrip("/")
+    ih = _upstream_headers()
+    wid = f"watch-{uuid.uuid4().hex[:16]}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(
+            f"{base_n}/notifications/mentions",
+            headers=ih,
+            json={
+                "mentioned_users": watchers,
+                "case_id": case_id,
+                "author": "system",
+                "excerpt": line[:800],
+                "case_title": f"watcher ping: {event}",
+                "comment_id": wid,
+            },
+        )
+    return {"notified": len(watchers)}
+
+
+@app.get("/soc/mentions/for-me")
+async def soc_mentions_for_me(request: Request, limit: int = 50):
+    _, user = _soc_auth_claims_and_user(request)
+    lim = max(1, min(int(limit), 100))
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT id, at, case_id, comment_id, author, mentioned_username, excerpt FROM sirp_mention_events "
+        "WHERE lower(mentioned_username) = lower($1) ORDER BY at DESC LIMIT $2",
+        user,
+        lim,
+    )
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "at": r["at"].isoformat() if r["at"] else None,
+                "case_id": r["case_id"],
+                "comment_id": r["comment_id"],
+                "author": r["author"],
+                "mentioned_username": r["mentioned_username"],
+                "excerpt": r["excerpt"],
+            }
+            for r in rows
+        ]
+    }
+
+
+async def _graph_upsert_edges(pool: asyncpg.Pool, edges: list[tuple[str, str, str, str, str]]) -> None:
+    for sk, sid, dk, did, rel in edges:
+        await pool.execute(
+            "INSERT INTO sirp_entity_edges(src_kind, src_id, dst_kind, dst_id, rel) VALUES($1,$2,$3,$4,$5) "
+            "ON CONFLICT (src_kind, src_id, dst_kind, dst_id, rel) DO UPDATE SET updated_at = now()",
+            sk[:32],
+            sid[:120],
+            dk[:32],
+            did[:120],
+            rel[:64],
+        )
+
+
+@app.post("/soc/graph/reindex")
+async def soc_graph_reindex(request: Request):
+    if INTERNAL_SERVICE_TOKEN and request.headers.get("x-internal-token") == INTERNAL_SERVICE_TOKEN:
+        actor = "internal"
+    else:
+        claims, actor = _soc_auth_claims_and_user(request)
+        if not _require_role_soft(claims, {"admin"}):
+            raise HTTPException(status_code=403, detail="Graph reindex requires admin (or internal token)")
+    ih = _upstream_headers()
+    base_c = SERVICE_MAP["cases"].rstrip("/")
+    base_a = SERVICE_MAP["alerts"].rstrip("/")
+    pool = await _get_pool()
+    edges_batch: list[tuple[str, str, str, str, str]] = []
+    async with httpx.AsyncClient(timeout=120) as client:
+        rc = await client.get(f"{base_c}/cases", headers=ih)
+        ra = await client.get(f"{base_a}/alerts", headers=ih)
+    cases: list[Any] = []
+    if rc.status_code == 200:
+        try:
+            d = rc.json()
+            if isinstance(d, list):
+                cases = d
+        except Exception:
+            pass
+    alerts: list[Any] = []
+    if ra.status_code == 200:
+        try:
+            d = ra.json()
+            if isinstance(d, list):
+                alerts = d
+        except Exception:
+            pass
+    for c in cases:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id") or "")
+        if not cid:
+            continue
+        ck, cnode = "case", cid
+        aid = c.get("alert_id")
+        if aid:
+            edges_batch.append((ck, cnode, "alert", str(aid), "source_alert"))
+        for ob in c.get("observables") or []:
+            if not isinstance(ob, dict) or not ob.get("value"):
+                continue
+            oid = f"{ob.get('type', '?')}:{str(ob.get('value'))[:200]}"
+            edges_batch.append((ck, cnode, "observable", oid, "case_observable"))
+        for lk in c.get("linked_case_ids") or []:
+            edges_batch.append((ck, cnode, "case", str(lk), "linked_case"))
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get("id") or "")
+        if not aid:
+            continue
+        nk, nnode = "alert", aid
+        for ob in a.get("observables") or []:
+            if not isinstance(ob, dict) or not ob.get("value"):
+                continue
+            oid = f"{ob.get('type', '?')}:{str(ob.get('value'))[:200]}"
+            edges_batch.append((nk, nnode, "observable", oid, "has_observable"))
+    for edge in edges_batch:
+        await _graph_upsert_edges(pool, [edge])
+    n = len(edges_batch)
+    logger.info("graph reindex by %s: %d edges from %d cases %d alerts", actor, n, len(cases), len(alerts))
+    return {"status": "ok", "edges_upserted": n, "cases": len(cases), "alerts": len(alerts)}
+
+
+@app.get("/soc/graph/neighbors")
+async def soc_graph_neighbors(request: Request, focus_kind: str, focus_id: str, limit: int = 200):
+    _soc_auth_user(request)
+    fk = focus_kind.strip().lower()[:32]
+    fid = focus_id.strip()[:120]
+    if not fk or not fid:
+        raise HTTPException(status_code=400, detail="focus_kind and focus_id required")
+    lim = max(1, min(int(limit), 500))
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT src_kind, src_id, dst_kind, dst_id, rel FROM sirp_entity_edges "
+        "WHERE (src_kind = $1 AND src_id = $2) OR (dst_kind = $1 AND dst_id = $2) LIMIT $3",
+        fk,
+        fid,
+        lim,
+    )
+    nodes: dict[str, dict[str, str]] = {}
+    edges_out: list[dict[str, str]] = []
+
+    def nid(k: str, i: str) -> str:
+        return f"{k}:{i}"
+
+    seed = nid(fk, fid)
+    nodes[seed] = {"id": seed, "kind": fk, "label": fid[:40]}
+    for r in rows:
+        sk, si, dk, di = r["src_kind"], r["src_id"], r["dst_kind"], r["dst_id"]
+        rel = str(r["rel"] or "")
+        s = nid(sk, si)
+        d = nid(dk, di)
+        nodes.setdefault(s, {"id": s, "kind": sk, "label": si[:60]})
+        nodes.setdefault(d, {"id": d, "kind": dk, "label": di[:60]})
+        edges_out.append({"from": s, "to": d, "rel": rel})
+    return {
+        "focus": {"kind": fk, "id": fid},
+        "nodes": list(nodes.values()),
+        "edges": edges_out,
+        "source": "sirp_entity_edges",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+@app.get("/soc/retro-hunt/siem")
+async def soc_retro_hunt_siem(request: Request, q: str, size: int = 40, index: str | None = None):
+    _soc_auth_user(request)
+    if len(q.strip()) < 2:
+        raise HTTPException(status_code=400, detail="q must be at least 2 characters")
+    ih = _upstream_headers()
+    base_a = SERVICE_MAP["alerts"].rstrip("/")
+    params: dict[str, Any] = {"q": q.strip(), "size": max(1, min(int(size), 100))}
+    if index and index.strip():
+        params["index"] = index.strip()
+    async with httpx.AsyncClient(timeout=45) as client:
+        r = await client.get(f"{base_a}/alerts/siem-retro-search", headers=ih, params=params)
+    if r.status_code != 200:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text[:200]
+        raise HTTPException(status_code=502, detail=str(detail)[:300])
+    return r.json()
+
+
+@app.post("/soc/custody-log")
+async def soc_custody_log(request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Custody logging requires analyst role or above")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str((body or {}).get("action") or "").strip()[:120]
+    if not action:
+        raise HTTPException(status_code=400, detail="action is required")
+    case_id = (body or {}).get("case_id")
+    case_id_s = str(case_id).strip()[:80] if case_id else None
+    evidence_id = (body or {}).get("evidence_id")
+    ev_s = str(evidence_id).strip()[:80] if evidence_id else None
+    detail = (body or {}).get("detail") if isinstance((body or {}).get("detail"), dict) else {}
+    pool = await _get_pool()
+    await pool.execute(
+        "INSERT INTO sirp_chain_of_custody(actor, action, case_id, evidence_id, detail) VALUES($1,$2,$3,$4,$5::jsonb)",
+        user,
+        action,
+        case_id_s,
+        ev_s,
+        json.dumps(detail),
+    )
+    return {"status": "logged"}
+
+
+@app.get("/soc/custody-log")
+async def soc_custody_log_list(request: Request, case_id: str | None = None, limit: int = 50):
+    _soc_auth_user(request)
+    lim = max(1, min(int(limit), 200))
+    pool = await _get_pool()
+    if case_id and case_id.strip():
+        rows = await pool.fetch(
+            "SELECT id, at, actor, action, case_id, evidence_id, detail FROM sirp_chain_of_custody "
+            "WHERE case_id = $1 ORDER BY at DESC LIMIT $2",
+            case_id.strip(),
+            lim,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT id, at, actor, action, case_id, evidence_id, detail FROM sirp_chain_of_custody "
+            "ORDER BY at DESC LIMIT $1",
+            lim,
+        )
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "at": r["at"].isoformat() if r["at"] else None,
+                "actor": r["actor"],
+                "action": r["action"],
+                "case_id": r["case_id"],
+                "evidence_id": r["evidence_id"],
+                "detail": r["detail"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/soc/shift-report")
+async def soc_shift_report_create(request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Shift reports require analyst role or above")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    summary = str((body or {}).get("summary") or "").strip()
+    if len(summary) < 3:
+        raise HTTPException(status_code=400, detail="summary must be at least 3 characters")
+    case_ids = (body or {}).get("case_ids") or []
+    alert_ids = (body or {}).get("alert_ids") or []
+    if not isinstance(case_ids, list):
+        case_ids = []
+    if not isinstance(alert_ids, list):
+        alert_ids = []
+    case_ids = [str(x)[:80] for x in case_ids[:200]]
+    alert_ids = [str(x)[:80] for x in alert_ids[:200]]
+    rid = uuid.uuid4()
+    pool = await _get_pool()
+    await pool.execute(
+        "INSERT INTO sirp_shift_reports(id, author, summary, case_refs, alert_refs) VALUES($1,$2,$3,$4::jsonb,$5::jsonb)",
+        rid,
+        user,
+        summary[:8000],
+        json.dumps(case_ids),
+        json.dumps(alert_ids),
+    )
+    return {"id": str(rid), "status": "created"}
+
+
+@app.get("/soc/shift-reports")
+async def soc_shift_reports_list(request: Request, limit: int = 40):
+    _soc_auth_user(request)
+    lim = max(1, min(int(limit), 100))
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT id, author, summary, case_refs, alert_refs, created_at FROM sirp_shift_reports "
+        "ORDER BY created_at DESC LIMIT $1",
+        lim,
+    )
+    return {
+        "items": [
+            {
+                "id": str(r["id"]),
+                "author": r["author"],
+                "summary": r["summary"],
+                "case_ids": r["case_refs"],
+                "alert_ids": r["alert_refs"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/soc/watchlist")
+async def soc_watchlist_add(request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Watchlist requires analyst role or above")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    cid = str((body or {}).get("case_id") or "").strip()
+    if not cid or len(cid) > 80:
+        raise HTTPException(status_code=400, detail="case_id required")
+    pool = await _get_pool()
+    await pool.execute(
+        "INSERT INTO sirp_case_watchers(case_id, username) VALUES($1, $2) ON CONFLICT DO NOTHING",
+        cid,
+        user,
+    )
+    return {"status": "watching", "case_id": cid}
+
+
+@app.delete("/soc/watchlist/{case_id:path}")
+async def soc_watchlist_remove(case_id: str, request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Watchlist requires analyst role or above")
+    cid = case_id.strip()[:80]
+    if not cid:
+        raise HTTPException(status_code=400, detail="Invalid case_id")
+    pool = await _get_pool()
+    await pool.execute("DELETE FROM sirp_case_watchers WHERE case_id = $1 AND username = $2", cid, user)
+    return {"status": "removed", "case_id": cid}
+
+
+@app.get("/soc/watchlist")
+async def soc_watchlist_list(request: Request):
+    _, user = _soc_auth_claims_and_user(request)
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT case_id, created_at FROM sirp_case_watchers WHERE username = $1 ORDER BY created_at DESC",
+        user,
+    )
+    return {
+        "items": [
+            {"case_id": r["case_id"], "created_at": r["created_at"].isoformat() if r["created_at"] else None}
+            for r in rows
+        ]
+    }
+
+
+@app.post("/soc/playbook-run-requests")
+async def soc_playbook_run_request_create(request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Playbook requests require analyst role or above")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    pb_id = str((body or {}).get("playbook_id") or "").strip()
+    if not pb_id or len(pb_id) > 120:
+        raise HTTPException(status_code=400, detail="playbook_id required")
+    case_id = (body or {}).get("case_id")
+    case_s = str(case_id).strip()[:80] if case_id else None
+    ev = (body or {}).get("event")
+    ev_json: dict[str, Any] = ev if isinstance(ev, dict) else {}
+    chain_raw = (body or {}).get("approval_chain")
+    chain_json: str | None = None
+    if isinstance(chain_raw, list) and chain_raw:
+        clean: list[dict[str, str]] = []
+        for step in chain_raw[:8]:
+            if isinstance(step, dict) and str(step.get("role") or "").strip() in VALID_ROLES:
+                clean.append({"role": str(step["role"]).strip()})
+        if clean:
+            chain_json = json.dumps(clean)
+    rid = uuid.uuid4()
+    pool = await _get_pool()
+    await pool.execute(
+        "INSERT INTO sirp_playbook_run_requests(id, playbook_id, requester, case_id, event_payload, status, "
+        "approval_chain, current_step, step_approvals) "
+        "VALUES($1,$2,$3,$4,$5::jsonb,'pending',$6::jsonb,0,'[]'::jsonb)",
+        rid,
+        pb_id,
+        user,
+        case_s,
+        json.dumps(ev_json),
+        chain_json,
+    )
+    return {"id": str(rid), "status": "pending"}
+
+
+@app.get("/soc/playbook-run-requests")
+async def soc_playbook_run_requests_list(request: Request, status: str | None = None, limit: int = 50):
+    _soc_auth_user(request)
+    lim = max(1, min(int(limit), 100))
+    pool = await _get_pool()
+    st = (status or "").strip().lower()
+    if st in {"pending", "approved", "rejected"}:
+        rows = await pool.fetch(
+            "SELECT id, playbook_id, requester, case_id, event_payload, status, approver, resolution_note, "
+            "created_at, resolved_at, approval_chain, current_step, step_approvals "
+            "FROM sirp_playbook_run_requests WHERE status = $1 "
+            "ORDER BY created_at DESC LIMIT $2",
+            st,
+            lim,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT id, playbook_id, requester, case_id, event_payload, status, approver, resolution_note, "
+            "created_at, resolved_at, approval_chain, current_step, step_approvals "
+            "FROM sirp_playbook_run_requests ORDER BY created_at DESC LIMIT $1",
+            lim,
+        )
+    return {
+        "items": [
+            {
+                "id": str(r["id"]),
+                "playbook_id": r["playbook_id"],
+                "requester": r["requester"],
+                "case_id": r["case_id"],
+                "event_payload": r["event_payload"],
+                "status": r["status"],
+                "approver": r["approver"],
+                "resolution_note": r["resolution_note"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "resolved_at": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+                "approval_chain": r["approval_chain"],
+                "current_step": r["current_step"],
+                "step_approvals": r["step_approvals"],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/soc/playbook-run-requests/{req_id}/approve")
+async def soc_playbook_run_request_approve(req_id: str, request: Request):
+    claims, approver = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"admin", "responder"}):
+        raise HTTPException(status_code=403, detail="Only responder or admin can approve playbook runs")
+    try:
+        rid = uuid.UUID(req_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request id")
+    pool = await _get_pool()
+    row = await pool.fetchrow(
+        "SELECT playbook_id, case_id, event_payload, status, approval_chain, current_step, step_approvals "
+        "FROM sirp_playbook_run_requests WHERE id = $1",
+        rid,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if str(row["status"]) != "pending":
+        raise HTTPException(status_code=400, detail="Request is not pending")
+    payload: dict[str, Any] = {}
+    ep = row["event_payload"]
+    if isinstance(ep, dict):
+        payload = dict(ep)
+    elif isinstance(ep, str):
+        try:
+            payload = dict(json.loads(ep))
+        except Exception:
+            payload = {}
+    if row["case_id"]:
+        payload.setdefault("case_id", row["case_id"])
+
+    chain_val = row["approval_chain"]
+    chain: list[dict[str, Any]] = []
+    if isinstance(chain_val, list):
+        chain = [x for x in chain_val if isinstance(x, dict)]
+    elif isinstance(chain_val, str):
+        try:
+            parsed = json.loads(chain_val)
+            if isinstance(parsed, list):
+                chain = [x for x in parsed if isinstance(x, dict)]
+        except Exception:
+            chain = []
+
+    step_idx = int(row["current_step"] or 0)
+    hist_val = row["step_approvals"]
+    step_hist: list[Any] = []
+    if isinstance(hist_val, list):
+        step_hist = list(hist_val)
+    elif isinstance(hist_val, str):
+        try:
+            parsed = json.loads(hist_val)
+            if isinstance(parsed, list):
+                step_hist = list(parsed)
+        except Exception:
+            step_hist = []
+
+    async def _run_automation() -> Any:
+        base_auto = SERVICE_MAP["automation"].rstrip("/")
+        url = f"{base_auto}/automation/playbooks/{row['playbook_id']}/run"
+        ih = _upstream_headers()
+        async with httpx.AsyncClient(timeout=120) as client:
+            rr = await client.post(url, headers=ih, json=payload)
+        if rr.status_code >= 400:
+            raise HTTPException(status_code=502, detail=f"Automation run failed: HTTP {rr.status_code}")
+        try:
+            return rr.json()
+        except Exception:
+            return {"raw": rr.text[:500]}
+
+    if not chain:
+        run_body = await _run_automation()
+        await pool.execute(
+            "UPDATE sirp_playbook_run_requests SET status = 'approved', approver = $2, resolved_at = now(), "
+            "resolution_note = $3 WHERE id = $1",
+            rid,
+            approver,
+            "executed_via_gateway",
+        )
+        return {"status": "approved", "automation": run_body}
+
+    if step_idx >= len(chain):
+        raise HTTPException(status_code=400, detail="Approval chain already completed")
+    required_role = str(chain[step_idx].get("role") or "").strip()
+    if required_role not in VALID_ROLES or not _require_role_soft(claims, {required_role}):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Step {step_idx + 1}/{len(chain)} requires role: {required_role}",
+        )
+    step_hist.append(
+        {"step": step_idx, "approver": approver, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    )
+    step_idx += 1
+    if step_idx >= len(chain):
+        run_body = await _run_automation()
+        await pool.execute(
+            "UPDATE sirp_playbook_run_requests SET status = 'approved', approver = $2, resolved_at = now(), "
+            "resolution_note = $3, current_step = $4, step_approvals = $5::jsonb WHERE id = $1",
+            rid,
+            approver,
+            "multi_step_executed",
+            step_idx,
+            json.dumps(step_hist),
+        )
+        return {"status": "approved", "automation": run_body, "approval_steps": step_hist}
+
+    await pool.execute(
+        "UPDATE sirp_playbook_run_requests SET current_step = $2, step_approvals = $3::jsonb WHERE id = $1",
+        rid,
+        step_idx,
+        json.dumps(step_hist),
+    )
+    return {
+        "status": "pending_next_step",
+        "current_step": step_idx,
+        "total_steps": len(chain),
+        "step_approvals": step_hist,
+    }
+
+
+@app.post("/soc/playbook-run-requests/{req_id}/reject")
+async def soc_playbook_run_request_reject(req_id: str, request: Request):
+    claims, approver = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"admin", "responder"}):
+        raise HTTPException(status_code=403, detail="Only responder or admin can reject playbook runs")
+    try:
+        rid = uuid.UUID(req_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid request id")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    note = str((body or {}).get("note") or "").strip()[:500]
+    pool = await _get_pool()
+    r = await pool.execute(
+        "UPDATE sirp_playbook_run_requests SET status = 'rejected', approver = $2, resolved_at = now(), "
+        "resolution_note = $3 WHERE id = $1 AND status = 'pending'",
+        rid,
+        approver,
+        note or "rejected",
+    )
+    if r == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="Pending request not found")
+    return {"status": "rejected"}
+
+
+@app.get("/soc/investigation-graph")
+async def soc_investigation_graph(request: Request, case_id: str | None = None, alert_id: str | None = None):
+    _soc_auth_user(request)
+    if not case_id and not alert_id:
+        raise HTTPException(status_code=400, detail="Provide case_id or alert_id")
+    async with httpx.AsyncClient(timeout=60) as client:
+        return await _investigation_graph_payload(
+            client,
+            case_id=case_id.strip() if case_id else None,
+            alert_id=alert_id.strip() if alert_id else None,
+        )
+
+
+@app.get("/soc/investigation-bundle")
+async def soc_investigation_bundle(request: Request, case_id: str):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Bundle download requires analyst role or above")
+    cid = case_id.strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="case_id required")
+    ih = _upstream_headers()
+    base_c = SERVICE_MAP["cases"].rstrip("/")
+    pool = await _get_pool()
+    async with httpx.AsyncClient(timeout=90) as client:
+        er = await client.get(f"{base_c}/cases/{cid}/export", headers=ih)
+        if er.status_code != 200:
+            raise HTTPException(status_code=er.status_code, detail="Case export failed upstream")
+        export_payload = er.json()
+        graph = await _investigation_graph_payload(client, case_id=cid)
+    custody_rows = await pool.fetch(
+        "SELECT id, at, actor, action, evidence_id, detail FROM sirp_chain_of_custody "
+        "WHERE case_id = $1 ORDER BY at DESC LIMIT 40",
+        cid,
+    )
+    custody_out = [
+        {
+            "id": r["id"],
+            "at": r["at"].isoformat() if r["at"] else None,
+            "actor": r["actor"],
+            "action": r["action"],
+            "evidence_id": r["evidence_id"],
+            "detail": r["detail"],
+        }
+        for r in custody_rows
+    ]
+    await pool.execute(
+        "INSERT INTO sirp_chain_of_custody(actor, action, case_id, detail) VALUES($1,$2,$3,$4::jsonb)",
+        user,
+        "investigation_bundle_download",
+        cid,
+        json.dumps({"bundle_version": 1}),
+    )
+    return {
+        "bundle_version": 1,
+        "assembled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "export": export_payload,
+        "graph": graph,
+        "custody_recent": custody_out,
+    }
+
+
+@app.get("/soc/analytics-advanced")
+async def soc_analytics_advanced(request: Request):
+    _soc_auth_user(request)
+    ih = _upstream_headers()
+    base_cases = SERVICE_MAP["cases"].rstrip("/")
+    base_alerts = SERVICE_MAP["alerts"].rstrip("/")
+    async with httpx.AsyncClient(timeout=60) as client:
+        ra, rc = await asyncio.gather(
+            client.get(f"{base_alerts}/alerts", headers=ih),
+            client.get(f"{base_cases}/cases", headers=ih),
+        )
+    alerts: list[Any] = []
+    cases: list[Any] = []
+    if ra.status_code == 200:
+        try:
+            data = ra.json()
+            if isinstance(data, list):
+                alerts = data
+        except Exception:
+            pass
+    if rc.status_code == 200:
+        try:
+            data = rc.json()
+            if isinstance(data, list):
+                cases = data
+        except Exception:
+            pass
+    by_status: dict[str, int] = {}
+    unassigned_alerts = 0
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        st = str(a.get("status") or "unknown").lower()
+        by_status[st] = by_status.get(st, 0) + 1
+        if not (str(a.get("assigned_to") or "").strip()):
+            unassigned_alerts += 1
+    unassigned_cases = sum(
+        1 for c in cases if isinstance(c, dict) and not (str(c.get("assigned_to") or "").strip())
+    )
+    n_alerts = len(alerts)
+    closed_n = by_status.get("closed", 0)
+    noise_proxy = round(100.0 * closed_n / n_alerts, 1) if n_alerts else None
+    sev_counts: dict[str, int] = {}
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        sv = str(a.get("severity") or "unknown").lower()
+        sev_counts[sv] = sev_counts.get(sv, 0) + 1
+    case_status: dict[str, int] = {}
+    for c in cases:
+        if not isinstance(c, dict):
+            continue
+        st = str(c.get("status") or "unknown").lower()
+        case_status[st] = case_status.get(st, 0) + 1
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "alerts": {
+            "total": n_alerts,
+            "by_status": by_status,
+            "by_severity": sev_counts,
+            "unassigned": unassigned_alerts,
+            "closure_ratio_percent": noise_proxy,
+        },
+        "cases": {
+            "total": len(cases),
+            "by_status": case_status,
+            "unassigned": unassigned_cases,
+        },
+    }
+
+
+@app.get("/soc/retro-hunt")
+async def soc_retro_hunt(request: Request, q: str, limit: int = 40):
+    _soc_auth_user(request)
+    qn = q.strip().lower()
+    if len(qn) < 2:
+        raise HTTPException(status_code=400, detail="q must be at least 2 characters")
+    lim = max(1, min(int(limit), 200))
+    base_o = SERVICE_MAP["observables"].rstrip("/")
+    ih = _upstream_headers()
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{base_o}/observables", headers=ih)
+    obs: list[Any] = []
+    if r.status_code == 200:
+        try:
+            data = r.json()
+            if isinstance(data, list):
+                obs = data
+        except Exception:
+            pass
+    hits: list[dict[str, Any]] = []
+    for o in obs:
+        if not isinstance(o, dict):
+            continue
+        val = str(o.get("value") or "").lower()
+        typ = str(o.get("type") or "").lower()
+        if qn in val or qn in typ:
+            hits.append(
+                {
+                    "id": o.get("id"),
+                    "type": o.get("type"),
+                    "value": o.get("value"),
+                    "created_at": o.get("created_at"),
+                }
+            )
+        if len(hits) >= lim:
+            break
+    return {"query": q, "scanned": len(obs), "matches": hits[:lim]}
+
+
+@app.get("/soc/enrichment-hints")
+async def soc_enrichment_hints(request: Request, alert_id: str):
+    _soc_auth_user(request)
+    aid = alert_id.strip()
+    if not aid:
+        raise HTTPException(status_code=400, detail="alert_id required")
+    ih = _upstream_headers()
+    base_a = SERVICE_MAP["alerts"].rstrip("/")
+    async with httpx.AsyncClient(timeout=20) as client:
+        ar = await client.get(f"{base_a}/alerts/{aid}", headers=ih)
+    if ar.status_code != 200:
+        raise HTTPException(status_code=ar.status_code, detail="Alert not found")
+    alert = ar.json()
+    if not isinstance(alert, dict):
+        raise HTTPException(status_code=502, detail="Invalid alert")
+    hints: list[dict[str, str]] = []
+    for ob in alert.get("observables") or []:
+        if not isinstance(ob, dict):
+            continue
+        t = str(ob.get("type") or "").lower()
+        v = str(ob.get("value") or "").strip()
+        if not v:
+            continue
+        if t == "ip" or "." in v and t in {"", "ip", "ipv4"}:
+            hints.append(
+                {
+                    "kind": "abuseipdb_candidate",
+                    "ioc_type": t or "ip",
+                    "ioc_value": v,
+                    "note": "Use Alerts → AbuseIPDB lookup from UI",
+                }
+            )
+        hints.append(
+            {
+                "kind": "opencti_search",
+                "ioc_type": t or "other",
+                "ioc_value": v,
+                "note": "Pivot via OpenCTI nav or case intel modal",
+            }
+        )
+    return {"alert_id": aid, "hints": hints[:40]}
+
+
 # ── Inbound SIEM ingest (no gateway rate limit; token + alert-service allowlist) ─
 def _validate_webhook_token(request: Request) -> None:
     provided = request.headers.get("x-webhook-token", "")
@@ -1073,6 +2179,14 @@ async def proxy(service: str, path: str, request: Request):
             _require_role(claims, {"analyst", "responder", "admin", "readonly"})
         if service == "secrets":
             _require_role(claims, {"admin"})
+        if (
+            service == "notifications"
+            and request.method == "POST"
+            and claims
+            and path.rstrip("/") == "notifications/test"
+            and not _require_role_soft(claims, {"analyst", "responder", "admin"})
+        ):
+            raise HTTPException(status_code=403, detail="Test notification requires analyst role or above")
 
     body = await request.body()
     url = urljoin(f"{target.rstrip('/')}/", path)

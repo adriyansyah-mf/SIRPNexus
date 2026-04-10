@@ -105,6 +105,25 @@ async def test_notification(payload: dict):
     return {"status": "sent"}
 
 
+@app.post("/notifications/mentions")
+async def notify_mentions(payload: dict):
+    """Targeted @mention line (email + Slack/Discord) for case comments."""
+    users = payload.get("mentioned_users") or []
+    case_id = str(payload.get("case_id", ""))
+    author = str(payload.get("author", ""))
+    excerpt = str(payload.get("excerpt", ""))[:600]
+    title = str(payload.get("case_title", ""))[:200]
+    line = (
+        f"SIRP @mention — case {case_id}\n"
+        f"Title: {title}\nAuthor: {author}\n"
+        f"Mentioned: {', '.join(str(u) for u in users)}\n---\n{excerpt}"
+    )
+    await _notify_email(f"[SIRP] Mention in case {case_id[:10]}", line)
+    await _notify_webhook(await _secret_value("SLACK_WEBHOOK_URL"), {"text": line[:2800]})
+    await _notify_webhook(await _secret_value("DISCORD_WEBHOOK_URL"), {"content": line[:1800]})
+    return {"status": "sent", "mentioned": len(users)}
+
+
 async def _worker():
     assert consumer
     async for msg in consumer:

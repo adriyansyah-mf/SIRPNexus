@@ -57,7 +57,18 @@ type Modal =
   | { type: 'assign'; id: string }
   | { type: 'tags'; id: string; current: string[] }
   | { type: 'status'; id: string }
-  | { type: 'detail'; alert: Alert };
+  | { type: 'detail'; alert: Alert }
+  | { type: 'bulk-assign'; ids: string[] }
+  | { type: 'bulk-tags'; ids: string[] }
+  | { type: 'bulk-status'; ids: string[] }
+  | { type: 'bulk-escalate'; ids: string[] };
+
+async function runInChunks<T>(items: T[], chunkSize: number, fn: (item: T) => Promise<void>): Promise<void> {
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    await Promise.all(chunk.map((item) => fn(item)));
+  }
+}
 
 function sevBadge(sev?: string) {
   const s = (sev || 'medium').toLowerCase();
@@ -91,6 +102,7 @@ export default function AlertsPage() {
   const [modal, setModal] = useState<Modal | null>(null);
   const [modalInput, setModalInput] = useState('');
   const [viewPresets, setViewPresets] = useState<ViewPreset[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
@@ -151,11 +163,15 @@ export default function AlertsPage() {
     if (token) headers['authorization'] = `Bearer ${token}`;
 
     if (modal.type === 'assign') {
+      if (!modalInput.trim()) {
+        notify('Enter assignee');
+        return;
+      }
       await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/assign`, {
         method: 'POST', headers,
-        body: JSON.stringify({ assigned_to: modalInput, assigned_by: 'ui-admin' }),
+        body: JSON.stringify({ assigned_to: modalInput.trim(), assigned_by: 'ui-admin' }),
       });
-      notify(`Assigned alert to ${modalInput}`);
+      notify(`Assigned alert to ${modalInput.trim()}`);
     } else if (modal.type === 'tags') {
       const tags = modalInput.split(',').map((t) => t.trim()).filter(Boolean);
       await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/tags`, {
@@ -169,6 +185,59 @@ export default function AlertsPage() {
         body: JSON.stringify({ status: modalInput }),
       });
       notify(`Status set to ${modalInput}`);
+    } else if (modal.type === 'bulk-assign') {
+      if (!modalInput.trim()) {
+        notify('Enter assignee');
+        return;
+      }
+      const assignee = modalInput.trim();
+      await runInChunks(modal.ids, 5, async (id) => {
+        await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/assign`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ assigned_to: assignee, assigned_by: 'bulk-ui' }),
+        });
+      });
+      notify(`Assigned ${modal.ids.length} alerts to ${assignee}`);
+      setSelected(new Set());
+    } else if (modal.type === 'bulk-tags') {
+      const tags = modalInput.split(',').map((t) => t.trim()).filter(Boolean);
+      if (!tags.length) {
+        notify('Enter at least one tag');
+        return;
+      }
+      await runInChunks(modal.ids, 5, async (id) => {
+        await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/tags`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ tags }),
+        });
+      });
+      notify(`Added tags to ${modal.ids.length} alerts`);
+      setSelected(new Set());
+    } else if (modal.type === 'bulk-status') {
+      await runInChunks(modal.ids, 5, async (id) => {
+        await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/status`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ status: modalInput }),
+        });
+      });
+      notify(`Updated status on ${modal.ids.length} alerts`);
+      setSelected(new Set());
+    } else if (modal.type === 'bulk-escalate') {
+      let ok = 0;
+      let fail = 0;
+      await runInChunks(modal.ids, 3, async (id) => {
+        const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/escalate`, {
+          method: 'POST',
+          headers: token ? { authorization: `Bearer ${token}` } : {},
+        });
+        if (res.ok) ok += 1;
+        else fail += 1;
+      });
+      notify(`Escalated ${ok} alert(s)${fail ? `, ${fail} failed` : ''}`);
+      setSelected(new Set());
     }
     closeModal();
     load();
@@ -216,6 +285,32 @@ export default function AlertsPage() {
     }
     return true;
   });
+
+  const filteredIds = filtered.map((a) => a.id);
+  const allFilteredSelected = filteredIds.length > 0 && filteredIds.every((id) => selected.has(id));
+  const someFilteredSelected = filteredIds.some((id) => selected.has(id));
+  const selectedList = [...selected];
+
+  const toggleRowSelect = (id: string) => {
+    setSelected((prev) => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  };
+
+  const toggleSelectAllFiltered = () => {
+    if (allFilteredSelected) {
+      setSelected((prev) => {
+        const n = new Set(prev);
+        filteredIds.forEach((id) => n.delete(id));
+        return n;
+      });
+    } else {
+      setSelected((prev) => new Set([...prev, ...filteredIds]));
+    }
+  };
 
   return (
     <div>
@@ -275,10 +370,73 @@ export default function AlertsPage() {
         </select>
       </div>
 
+      {selectedList.length > 0 ? (
+        <div
+          className="card mb-3 flex gap-2 flex-wrap items-center"
+          style={{ padding: '10px 12px', background: 'var(--bg-elevated)' }}
+        >
+          <span style={{ fontSize: 13 }}>
+            <strong>{selectedList.length}</strong> selected
+          </span>
+          <button type="button" style={{ fontSize: 12 }} onClick={() => setSelected(new Set())}>
+            Clear
+          </button>
+          <button
+            type="button"
+            style={{ fontSize: 12 }}
+            onClick={() => {
+              setModal({ type: 'bulk-assign', ids: selectedList });
+              setModalInput('');
+            }}
+          >
+            Assign all…
+          </button>
+          <button
+            type="button"
+            style={{ fontSize: 12 }}
+            onClick={() => {
+              setModal({ type: 'bulk-tags', ids: selectedList });
+              setModalInput('');
+            }}
+          >
+            Add tags…
+          </button>
+          <button
+            type="button"
+            style={{ fontSize: 12 }}
+            onClick={() => {
+              setModal({ type: 'bulk-status', ids: selectedList });
+              setModalInput('triaged');
+            }}
+          >
+            Set status…
+          </button>
+          <button
+            type="button"
+            className="btn-danger"
+            style={{ fontSize: 12 }}
+            onClick={() => setModal({ type: 'bulk-escalate', ids: selectedList })}
+          >
+            Escalate all…
+          </button>
+        </div>
+      ) : null}
+
       {/* Table */}
       <table className="data-table">
         <thead>
           <tr>
+            <th style={{ width: 36, textAlign: 'center' }}>
+              <input
+                type="checkbox"
+                title="Select all visible"
+                checked={allFilteredSelected}
+                ref={(el) => {
+                  if (el) el.indeterminate = someFilteredSelected && !allFilteredSelected;
+                }}
+                onChange={toggleSelectAllFiltered}
+              />
+            </th>
             <th style={{ width: 14 }}></th>
             <th>Title</th>
             <th className="hide-mobile">Endpoint</th>
@@ -295,6 +453,14 @@ export default function AlertsPage() {
         <tbody>
           {filtered.map((a) => (
             <tr key={a.id}>
+              <td style={{ textAlign: 'center' }} onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  checked={selected.has(a.id)}
+                  onChange={() => toggleRowSelect(a.id)}
+                  aria-label={`Select alert ${a.id}`}
+                />
+              </td>
               <td><span className={`indicator ind-${(a.severity || 'medium').toLowerCase()}`}></span></td>
               <td>
                 <Link
@@ -357,7 +523,7 @@ export default function AlertsPage() {
             </tr>
           ))}
           {!filtered.length && (
-            <tr><td colSpan={11}><div className="empty-state">No alerts match your filters.</div></td></tr>
+            <tr><td colSpan={12}><div className="empty-state">No alerts match your filters.</div></td></tr>
           )}
         </tbody>
       </table>
@@ -370,23 +536,33 @@ export default function AlertsPage() {
               {modal.type === 'assign' && 'Assign Alert'}
               {modal.type === 'tags' && 'Edit Tags'}
               {modal.type === 'status' && 'Update Status'}
+              {modal.type === 'bulk-assign' && `Assign ${modal.ids.length} alerts`}
+              {modal.type === 'bulk-tags' && `Add tags to ${modal.ids.length} alerts`}
+              {modal.type === 'bulk-status' && `Set status on ${modal.ids.length} alerts`}
+              {modal.type === 'bulk-escalate' && `Escalate ${modal.ids.length} alerts to cases`}
             </div>
 
-            {modal.type === 'assign' && (
+            {modal.type === 'bulk-escalate' && (
+              <p style={{ fontSize: 13, color: 'var(--text-secondary)', marginTop: 0 }}>
+                Creates one case per alert (skips duplicates where the API reports already escalated). Runs in small parallel batches.
+              </p>
+            )}
+
+            {(modal.type === 'assign' || modal.type === 'bulk-assign') && (
               <>
                 <label>Assign to (username)</label>
                 <input autoFocus value={modalInput} onChange={(e) => setModalInput(e.target.value)} className="w-full" placeholder="analyst@team" />
               </>
             )}
 
-            {modal.type === 'tags' && (
+            {(modal.type === 'tags' || modal.type === 'bulk-tags') && (
               <>
-                <label>Tags (comma separated)</label>
+                <label>Tags to add (comma separated)</label>
                 <input autoFocus value={modalInput} onChange={(e) => setModalInput(e.target.value)} className="w-full" placeholder="triaged, malware, phishing" />
               </>
             )}
 
-            {modal.type === 'status' && (
+            {(modal.type === 'status' || modal.type === 'bulk-status') && (
               <>
                 <label>New status</label>
                 <select value={modalInput} onChange={(e) => setModalInput(e.target.value)} className="w-full">

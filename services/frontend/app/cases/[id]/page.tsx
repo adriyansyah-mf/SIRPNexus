@@ -286,6 +286,15 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     setC(data);
   };
 
+  const logCustody = (action: string, detail?: Record<string, unknown>) => {
+    if (!token) return;
+    void fetch(`${CLIENT_API_PREFIX}/soc/custody-log`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ action, case_id: params.id, detail: detail || {} }),
+    }).catch(() => {});
+  };
+
   const exportCaseJson = async () => {
     if (!token) {
       notify('Sign in to export', false);
@@ -310,9 +319,23 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       a.remove();
       URL.revokeObjectURL(url);
       notify('Export downloaded');
+      logCustody('case_json_export', { source: 'case-detail' });
     } catch {
       notify('Export failed', false);
     }
+  };
+
+  const watchThisCase = async () => {
+    if (!token) {
+      notify('Sign in to watch', false);
+      return;
+    }
+    const res = await fetch(`${CLIENT_API_PREFIX}/soc/watchlist`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ case_id: params.id }),
+    });
+    notify(res.ok ? 'Added to your IR watchlist' : 'Could not add watch', res.ok);
   };
 
   useEffect(() => {
@@ -577,6 +600,12 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
           <button type="button" onClick={() => void exportCaseJson()} style={{ fontSize: 12 }}>
             Export JSON
           </button>
+          <button type="button" onClick={() => void watchThisCase()} style={{ fontSize: 12 }}>
+            Watch case
+          </button>
+          <Link href={`/ir-center?case=${encodeURIComponent(params.id)}`} style={{ fontSize: 12, alignSelf: 'center' }}>
+            IR center →
+          </Link>
           <button onClick={load}>↻ Refresh</button>
         </div>
       </div>
@@ -1080,7 +1109,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
             <textarea
               value={commentText}
               onChange={(e) => setCommentText(e.target.value)}
-              placeholder="Write a comment…"
+              placeholder="Write a comment… Use @analyst to notify (email/Slack via gateway)"
               style={{ width: '100%', minHeight: 80, resize: 'vertical', marginBottom: 8 }}
             />
             <button className="btn-primary" onClick={addComment}>Post Comment</button>

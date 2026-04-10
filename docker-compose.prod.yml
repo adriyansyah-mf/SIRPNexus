@@ -135,6 +135,7 @@ services:
     env_file: .env
     environment:
       CASE_EVIDENCE_DIR: /home/appuser/data/case-evidence
+      API_GATEWAY_URL: http://api-gateway:8000
     volumes:
       - case_evidence:/home/appuser/data/case-evidence
     depends_on:

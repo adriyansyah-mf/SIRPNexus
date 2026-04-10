@@ -22,6 +22,7 @@ producer: AIOKafkaProducer | None = None
 db_pool: asyncpg.Pool | None = None
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://api-gateway:8000").rstrip("/")
 ALERT_SERVICE_URL = os.getenv("ALERT_SERVICE_URL", "http://alert-service:8001").rstrip("/")
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "")
 FERNET = Fernet(DATA_ENCRYPTION_KEY.encode()) if DATA_ENCRYPTION_KEY else None
@@ -71,6 +72,84 @@ def _decrypt_case_payload(case: dict[str, Any]) -> dict[str, Any]:
 async def _emit(event: str, payload: dict[str, Any]):
     assert producer
     await producer.send_and_wait("cases.updated", json.dumps({"event": event, **payload}, default=str).encode())
+    await _post_emit_gateway_hooks(event, payload)
+
+
+async def _notify_gateway_watchers(event: str, case_id: str, summary: str, actor: str) -> None:
+    if not INTERNAL_SERVICE_TOKEN or not API_GATEWAY_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            await client.post(
+                f"{API_GATEWAY_URL}/soc/internal/watchers/notify",
+                headers={"x-internal-token": INTERNAL_SERVICE_TOKEN},
+                json={"case_id": case_id, "event": event, "summary": summary[:500], "actor": actor},
+            )
+    except Exception:
+        pass
+
+
+async def _post_emit_gateway_hooks(event: str, payload: dict[str, Any]) -> None:
+    if event not in {
+        "comment_added",
+        "status_updated",
+        "task_added",
+        "evidence_uploaded",
+        "case_linked",
+        "assigned",
+        "created",
+    }:
+        return
+    cid = payload.get("case_id")
+    if not cid and isinstance(payload.get("case"), dict):
+        cid = payload["case"].get("id")
+    if not cid:
+        return
+    actor = str(payload.get("actor", "") or payload.get("assignment", {}).get("assigned_by", "") or "")
+    summary = event
+    if event == "comment_added" and isinstance(payload.get("comment"), dict):
+        summary = str(payload["comment"].get("text", ""))[:200] or event
+    elif event == "status_updated":
+        summary = f"status → {payload.get('status', '')}"
+    elif event == "task_added" and isinstance(payload.get("task"), dict):
+        summary = f"task: {payload['task'].get('title', '')}"
+    elif event == "evidence_uploaded":
+        summary = f"evidence: {payload.get('filename', '')}"
+    elif event == "case_linked":
+        summary = f"linked → {payload.get('target_case_id', '')}"
+    elif event == "assigned":
+        summary = f"assigned → {payload.get('assignment', {}).get('assigned_to', '')}"
+    elif event == "created":
+        summary = "new case"
+    await _notify_gateway_watchers(event, str(cid), summary, actor)
+
+
+async def _notify_gateway_mentions(
+    case_id: str,
+    comment_id: str,
+    author: str,
+    mentioned_users: list[str],
+    excerpt: str,
+    case_title: str,
+) -> None:
+    if not mentioned_users or not INTERNAL_SERVICE_TOKEN or not API_GATEWAY_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{API_GATEWAY_URL}/soc/internal/mentions/ingest",
+                headers={"x-internal-token": INTERNAL_SERVICE_TOKEN},
+                json={
+                    "case_id": case_id,
+                    "comment_id": comment_id,
+                    "author": author,
+                    "mentioned_users": mentioned_users,
+                    "excerpt": excerpt[:800],
+                    "case_title": case_title[:300],
+                },
+            )
+    except Exception:
+        pass
 
 
 def _validate_case_id(case_id: str) -> str:
@@ -543,7 +622,10 @@ async def assign_case(case_id: str, body: Assignment):
     )
     CASES[case_id] = case
     await _persist_case(case_id, case)
-    await _emit("assigned", {"case_id": case_id, "assignment": body.model_dump()})
+    await _emit(
+        "assigned",
+        {"case_id": case_id, "assignment": body.model_dump(), "actor": body.assigned_by},
+    )
     return case
 
 
@@ -584,7 +666,18 @@ async def add_comment(case_id: str, body: CommentBody):
     _append_case_audit(case, body.author, "comment_added", {"comment_id": comment["id"]})
     CASES[case_id] = case
     await _persist_case(case_id, case)
-    await _emit("comment_added", {"case_id": case_id, "comment": comment})
+    text_plain = str(comment.get("text") or "")
+    mention_users = sorted(set(re.findall(r"@([\w.\-]{2,80})", text_plain)))
+    if mention_users:
+        await _notify_gateway_mentions(
+            case_id,
+            comment["id"],
+            body.author,
+            mention_users,
+            text_plain,
+            str(case.get("title") or ""),
+        )
+    await _emit("comment_added", {"case_id": case_id, "comment": comment, "actor": body.author})
     return comment
 
 
