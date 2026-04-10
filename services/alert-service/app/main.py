@@ -593,6 +593,18 @@ async def _opencti_post_graphql(
     return payload
 
 
+def _compute_risk_score(alert: dict[str, Any]) -> int:
+    """Heuristic 0–100 for SOC queue prioritization (severity + IOC density + tags)."""
+    sev = str(alert.get("severity", "")).lower()
+    base = {"low": 18, "medium": 42, "high": 68, "critical": 92}.get(sev, 38)
+    obs = alert.get("observables")
+    n_obs = len(obs) if isinstance(obs, list) else 0
+    tags = alert.get("tags")
+    n_tags = len(tags) if isinstance(tags, list) else 0
+    bonus = min(28, n_obs * 4 + min(8, n_tags * 2))
+    return min(100, base + bonus)
+
+
 async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
     text = f"{normalized['title']} {normalized['description']} {normalized.get('summary', '')} {json.dumps(normalized['raw'])}"
     regex_obs = _extract_observables(text)
@@ -608,6 +620,7 @@ async def _ingest(normalized: dict[str, Any]) -> dict[str, Any]:
         normalized["observables"] = list(merged.values())
     else:
         normalized["observables"] = regex_obs
+    normalized["risk_score"] = _compute_risk_score(normalized)
     normalized["status"] = normalized.get("status", "new")
     ts = _now()
     normalized["ingested_at"] = ts
@@ -929,6 +942,8 @@ async def _get_alert_or_404(alert_id: str) -> dict[str, Any]:
             alert = _alert_payload_from_db(row["payload"])
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found")
+    if "risk_score" not in alert:
+        alert["risk_score"] = _compute_risk_score(alert)
     return alert
 
 
@@ -1057,7 +1072,11 @@ async def _all_alerts_payloads() -> list[dict[str, Any]]:
 
 @app.get("/alerts")
 async def list_alerts():
-    return await _all_alerts_payloads()
+    out = await _all_alerts_payloads()
+    for a in out:
+        if isinstance(a, dict) and "risk_score" not in a:
+            a["risk_score"] = _compute_risk_score(a)
+    return out
 
 
 @app.get("/alerts/{alert_id}/related")

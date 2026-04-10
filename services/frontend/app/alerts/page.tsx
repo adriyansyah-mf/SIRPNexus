@@ -1,7 +1,12 @@
 'use client';
 
+import Link from 'next/link';
 import { CLIENT_API_PREFIX } from '../../lib/clientApi';
 import { useEffect, useRef, useState } from 'react';
+
+const VIEW_PRESETS_KEY = 'sirp_alert_view_presets_v1';
+
+type ViewPreset = { name: string; filter: string; sev: string; status: string };
 
 type AgentBlock = { id?: string; name?: string; ip?: string };
 type RuleRef = {
@@ -23,6 +28,7 @@ type Alert = {
   tags?: string[];
   assigned_to?: string;
   created_at?: string;
+  risk_score?: number;
   agent?: AgentBlock;
   rule_ref?: RuleRef;
   location?: string;
@@ -84,7 +90,40 @@ export default function AlertsPage() {
   const [toast, setToast] = useState('');
   const [modal, setModal] = useState<Modal | null>(null);
   const [modalInput, setModalInput] = useState('');
+  const [viewPresets, setViewPresets] = useState<ViewPreset[]>([]);
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(VIEW_PRESETS_KEY);
+      if (raw) {
+        const p = JSON.parse(raw) as ViewPreset[];
+        if (Array.isArray(p)) setViewPresets(p);
+      }
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const persistPresets = (p: ViewPreset[]) => {
+    setViewPresets(p);
+    localStorage.setItem(VIEW_PRESETS_KEY, JSON.stringify(p));
+  };
+
+  const saveViewPreset = () => {
+    const name = window.prompt('Name for this filter view (e.g. Critical open)');
+    if (!name?.trim()) return;
+    persistPresets([{ name: name.trim(), filter, sev: sevFilter, status: statusFilter }, ...viewPresets].slice(0, 20));
+    notify(`Saved view "${name.trim()}"`);
+  };
+
+  const applyPreset = (name: string) => {
+    const p = viewPresets.find((x) => x.name === name);
+    if (!p) return;
+    setFilter(p.filter);
+    setSevFilter(p.sev);
+    setStatusFilter(p.status);
+  };
 
   const notify = (msg: string) => {
     setToast(msg);
@@ -186,12 +225,33 @@ export default function AlertsPage() {
           <h1>Alerts</h1>
           <div className="page-meta">{filtered.length} / {alerts.length} alerts</div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
+          <button type="button" onClick={saveViewPreset}>Save view</button>
           <button onClick={load}>↻ Refresh</button>
         </div>
       </div>
 
       {/* Filters */}
+      <div className="flex gap-2 mb-2" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
+        {viewPresets.length > 0 ? (
+          <label className="text-muted" style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+            Saved views
+            <select
+              value=""
+              onChange={(e) => {
+                if (e.target.value) applyPreset(e.target.value);
+                e.target.value = '';
+              }}
+              style={{ fontSize: 12 }}
+            >
+              <option value="">— load —</option>
+              {viewPresets.map((p) => (
+                <option key={p.name} value={p.name}>{p.name}</option>
+              ))}
+            </select>
+          </label>
+        ) : null}
+      </div>
       <div className="flex gap-2 mb-4" style={{ flexWrap: 'wrap' }}>
         <input
           placeholder="Search title, agent, IOC, rule, location…"
@@ -223,6 +283,7 @@ export default function AlertsPage() {
             <th>Title</th>
             <th className="hide-mobile">Endpoint</th>
             <th className="hide-mobile">IOCs</th>
+            <th>Risk</th>
             <th>Severity</th>
             <th className="hide-mobile">Source</th>
             <th>Status</th>
@@ -236,11 +297,19 @@ export default function AlertsPage() {
             <tr key={a.id}>
               <td><span className={`indicator ind-${(a.severity || 'medium').toLowerCase()}`}></span></td>
               <td>
-                <button
-                  onClick={() => setModal({ type: 'detail', alert: a })}
-                  style={{ background: 'none', border: 'none', padding: 0, color: 'var(--accent-blue)', textAlign: 'left', cursor: 'pointer', fontWeight: 500 }}
+                <Link
+                  href={`/alerts/${a.id}`}
+                  style={{ fontWeight: 500, color: 'var(--accent-blue)' }}
                 >
                   {a.title || 'Untitled'}
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => setModal({ type: 'detail', alert: a })}
+                  className="text-muted"
+                  style={{ display: 'block', fontSize: 11, background: 'none', border: 'none', padding: 0, cursor: 'pointer', marginTop: 2 }}
+                >
+                  Quick preview
                 </button>
                 {ruleMeta(a) ? <div className="alert-title-sub mono">{ruleMeta(a)}</div> : null}
                 {a.tags?.length ? (
@@ -269,6 +338,9 @@ export default function AlertsPage() {
                   <span className="text-muted">—</span>
                 )}
               </td>
+              <td>
+                <span className="badge badge-info" title="Queue priority score">{typeof a.risk_score === 'number' ? a.risk_score : '—'}</span>
+              </td>
               <td>{sevBadge(a.severity)}</td>
               <td className="text-muted hide-mobile">{a.source || '—'}</td>
               <td>{statusBadge(a.status)}</td>
@@ -285,7 +357,7 @@ export default function AlertsPage() {
             </tr>
           ))}
           {!filtered.length && (
-            <tr><td colSpan={10}><div className="empty-state">No alerts match your filters.</div></td></tr>
+            <tr><td colSpan={11}><div className="empty-state">No alerts match your filters.</div></td></tr>
           )}
         </tbody>
       </table>
@@ -354,6 +426,8 @@ export default function AlertsPage() {
                 <dd>{modal.alert.assigned_to || '—'}</dd>
                 <dt>Ingested</dt>
                 <dd className="mono" style={{ fontSize: 12 }}>{modal.alert.created_at || '—'}</dd>
+                <dt>Risk score</dt>
+                <dd><span className="badge badge-info">{typeof modal.alert.risk_score === 'number' ? modal.alert.risk_score : '—'}</span></dd>
               </dl>
             </div>
 

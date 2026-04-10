@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { CLIENT_API_PREFIX } from '../../lib/clientApi';
 import { useCallback, useEffect, useState } from 'react';
 import LiveFeed from './LiveFeed';
@@ -19,6 +20,24 @@ type CaseItem = {
   title: string;
   status?: string;
   created_at?: string;
+};
+
+type SocSummary = {
+  generated_at?: string;
+  alerts?: { total?: number; open?: number; critical?: number; avg_risk_score?: number; by_source?: Record<string, number> };
+  cases?: {
+    total?: number;
+    open?: number;
+    legal_hold?: number;
+    mttr_resolved_hours?: number | null;
+    incident_categories?: Record<string, number>;
+  };
+};
+
+type OpsHealth = {
+  generated_at?: string;
+  gateway_database?: { ok?: boolean };
+  services?: { service?: string; ok?: boolean }[];
 };
 
 function sevBadge(sev?: string) {
@@ -61,16 +80,36 @@ async function fetchJson<T>(path: string, token: string | null): Promise<T> {
 export default function DashboardClient() {
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [cases, setCases] = useState<CaseItem[]>([]);
+  const [soc, setSoc] = useState<SocSummary | null>(null);
+  const [ops, setOps] = useState<OpsHealth | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const load = useCallback(async () => {
     const token = typeof window !== 'undefined' ? localStorage.getItem('sirp_token') : null;
-    const [a, c] = await Promise.all([
+    const [a, c, s, o] = await Promise.all([
       fetchJson<AlertItem[]>('/alerts/alerts', token),
       fetchJson<CaseItem[]>('/cases/cases', token),
+      token
+        ? fetch(`${CLIENT_API_PREFIX}/soc/summary`, {
+            cache: 'no-store',
+            headers: { authorization: `Bearer ${token}` },
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null)
+        : Promise.resolve(null),
+      token
+        ? fetch(`${CLIENT_API_PREFIX}/soc/ops-status`, {
+            cache: 'no-store',
+            headers: { authorization: `Bearer ${token}` },
+          })
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null)
+        : Promise.resolve(null),
     ]);
     setAlerts(Array.isArray(a) ? a : []);
     setCases(Array.isArray(c) ? c : []);
+    setSoc(s && typeof s === 'object' ? (s as SocSummary) : null);
+    setOps(o && typeof o === 'object' ? (o as OpsHealth) : null);
     setLoaded(true);
   }, []);
 
@@ -133,6 +172,83 @@ export default function DashboardClient() {
         </div>
       </div>
 
+      {ops && !noToken ? (
+        <div className="card mb-4" style={{ padding: 14 }}>
+          <div className="card-title mb-2 flex gap-2 items-center flex-wrap">
+            Platform health
+            <Link href="/operations" style={{ fontSize: 11, fontWeight: 400 }}>
+              Details →
+            </Link>
+          </div>
+          {(() => {
+            const svc = ops.services || [];
+            const up = svc.filter((x) => x.ok).length;
+            const dbOk = ops.gateway_database?.ok !== false;
+            const allOk = dbOk && svc.length > 0 && svc.every((x) => x.ok);
+            return (
+              <div className="flex gap-4 flex-wrap" style={{ fontSize: 13 }}>
+                <div>
+                  <span className="text-muted">Microservices</span>{' '}
+                  <strong>
+                    {up}/{svc.length} up
+                  </strong>
+                  {!allOk && svc.some((x) => !x.ok) ? (
+                    <span className="badge badge-high" style={{ marginLeft: 8 }}>
+                      degraded
+                    </span>
+                  ) : (
+                    <span className="badge badge-resolved" style={{ marginLeft: 8 }}>
+                      ok
+                    </span>
+                  )}
+                </div>
+                <div>
+                  <span className="text-muted">Gateway DB</span>{' '}
+                  {dbOk ? <span className="badge badge-resolved">ok</span> : <span className="badge badge-high">down</span>}
+                </div>
+                <div className="text-muted" style={{ fontSize: 11 }}>
+                  Checked {ops.generated_at || '—'}
+                </div>
+              </div>
+            );
+          })()}
+        </div>
+      ) : null}
+
+      {soc && !noToken ? (
+        <div className="card mb-4" style={{ padding: 14 }}>
+          <div className="card-title mb-2">SOC summary <span className="text-muted" style={{ fontWeight: 400, fontSize: 11 }}>(API)</span></div>
+          <div className="flex gap-4 flex-wrap" style={{ fontSize: 13 }}>
+            <div>
+              <span className="text-muted">Avg alert risk</span>{' '}
+              <strong>{soc.alerts?.avg_risk_score ?? '—'}</strong>
+            </div>
+            <div>
+              <span className="text-muted">Alerts (open / total)</span>{' '}
+              <strong>{soc.alerts?.open ?? '—'}</strong> / {soc.alerts?.total ?? '—'}
+            </div>
+            <div>
+              <span className="text-muted">Cases on legal hold</span>{' '}
+              <strong>{soc.cases?.legal_hold ?? 0}</strong>
+            </div>
+            <div>
+              <span className="text-muted">MTTR (resolved)</span>{' '}
+              <strong>{soc.cases?.mttr_resolved_hours != null ? `${soc.cases.mttr_resolved_hours}h` : '—'}</strong>
+            </div>
+            <Link href="/hunting" style={{ fontSize: 12 }}>Hunting →</Link>
+          </div>
+          {soc.alerts?.by_source && Object.keys(soc.alerts.by_source).length > 0 ? (
+            <div className="text-muted mt-2" style={{ fontSize: 11 }}>
+              By source:{' '}
+              {Object.entries(soc.alerts.by_source)
+                .slice(0, 6)
+                .map(([k, v]) => `${k}: ${v}`)
+                .join(' · ')}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       <div className="two-col">
         <div>
           <div className="card-header">
@@ -154,7 +270,9 @@ export default function DashboardClient() {
               {recent.map((a) => (
                 <tr key={a.id}>
                   <td><span className={`indicator ind-${(a.severity || 'medium').toLowerCase()}`}></span></td>
-                  <td className="truncate" style={{ maxWidth: 280 }}>{a.title || 'Untitled'}</td>
+                  <td className="truncate" style={{ maxWidth: 280 }}>
+                    <Link href={`/alerts/${a.id}`} style={{ color: 'var(--accent-blue)' }}>{a.title || 'Untitled'}</Link>
+                  </td>
                   <td>{sevBadge(a.severity)}</td>
                   <td className="text-muted">{a.source || '—'}</td>
                   <td>{statusBadge(a.status)}</td>

@@ -109,6 +109,18 @@ async def _persist_case(case_id: str, case: dict[str, Any]):
     )
 
 
+MAX_CASE_AUDIT_EVENTS = 500
+
+
+def _append_case_audit(case: dict[str, Any], actor: str, action: str, detail: dict[str, Any] | None = None) -> None:
+    """Append-only SOC audit trail on the case document (field-level / action context)."""
+    case.setdefault("audit_events", [])
+    case["audit_events"].append(
+        {"at": _now(), "actor": actor or "system", "action": action, "detail": detail or {}}
+    )
+    case["audit_events"] = case["audit_events"][-MAX_CASE_AUDIT_EVENTS:]
+
+
 class CaseFromAlert(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -252,6 +264,35 @@ class CaseLinkBody(BaseModel):
         if not _UUID_RE.match(s):
             raise ValueError("invalid target case id")
         return s
+
+
+class SocMetaPatch(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    incident_category: str | None = None
+    legal_hold: bool | None = None
+    shift_handover_notes: str | None = None
+    actor: str = "analyst"
+
+    @field_validator("incident_category", mode="before")
+    @classmethod
+    def incident_cat_ok(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()[:120]
+        return s or None
+
+    @field_validator("shift_handover_notes", mode="before")
+    @classmethod
+    def handover_ok(cls, v: Any) -> str | None:
+        if v is None:
+            return None
+        return str(v)[:8000]
+
+    @field_validator("actor", mode="before")
+    @classmethod
+    def actor_ok(cls, v: Any) -> str:
+        return str(v or "analyst").strip()[:200] or "analyst"
 
 
 @app.on_event("startup")
@@ -398,7 +439,22 @@ async def get_case(case_id: str):
         raise HTTPException(status_code=404, detail="Case not found")
     case.setdefault("linked_case_ids", [])
     case.setdefault("evidence", [])
+    case.setdefault("audit_events", [])
+    case.setdefault("incident_category", None)
+    case.setdefault("legal_hold", False)
+    case.setdefault("shift_handover_notes", "")
     return case
+
+
+@app.get("/cases/{case_id}/export")
+async def export_case_bundle(case_id: str):
+    """Full case JSON for auditors / handover (includes audit_events, evidence metadata)."""
+    case = await get_case(case_id)
+    return {
+        "export_version": 2,
+        "exported_at": _now(),
+        "case": case,
+    }
 
 
 def _build_case(case_id: str, title: str, description: str, severity: str = "medium",
@@ -430,6 +486,10 @@ def _build_case(case_id: str, title: str, description: str, severity: str = "med
         "updated_at": _now(),
         "evidence": [],
         "linked_case_ids": [],
+        "audit_events": [],
+        "incident_category": None,
+        "legal_hold": False,
+        "shift_handover_notes": "",
     }
 
 
@@ -439,6 +499,7 @@ async def create_case(body: CaseCreate):
     case_id = str(uuid.uuid4())
     case = _build_case(case_id, body.title, body.description, body.severity, body.owner, tags=body.tags)
     case["timeline"] = [{"event": "case_created_manual", "at": _now()}]
+    _append_case_audit(case, body.owner or "system", "case_created", {"source": "manual", "title": body.title})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("created", {"case": case})
@@ -453,6 +514,12 @@ async def create_from_alert(body: CaseFromAlert):
         alert_id=body.alert_id, observables=body.observables, tags=body.tags,
     )
     case["timeline"][0]["event"] = "case_created_from_alert"
+    _append_case_audit(
+        case,
+        body.owner or "system",
+        "case_created",
+        {"source": "alert", "alert_id": body.alert_id, "title": body.title},
+    )
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("created", {"case": case})
@@ -462,11 +529,18 @@ async def create_from_alert(body: CaseFromAlert):
 @app.post("/cases/{case_id}/assign")
 async def assign_case(case_id: str, body: Assignment):
     case = await get_case(case_id)
+    prev_to = case.get("assigned_to")
     case["assigned_to"] = body.assigned_to
     case["assigned_by"] = body.assigned_by
     case["assigned_at"] = _now()
     case["updated_at"] = _now()
     case["timeline"].append({"event": "assigned", "at": _now(), **body.model_dump()})
+    _append_case_audit(
+        case,
+        body.assigned_by,
+        "assigned",
+        {"assigned_to": body.assigned_to, "previous_assigned_to": prev_to},
+    )
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("assigned", {"case_id": case_id, "assignment": body.model_dump()})
@@ -478,9 +552,16 @@ async def update_status(case_id: str, body: StatusBody):
     case = await get_case(case_id)
     if case["assigned_to"] and body.actor not in {case["assigned_to"], "admin"}:
         raise HTTPException(status_code=403, detail="Only owner or admin can update")
+    prev_status = case.get("status")
     case["status"] = body.status
     case["updated_at"] = _now()
     case["timeline"].append({"event": "status_changed", "at": _now(), **body.model_dump()})
+    _append_case_audit(
+        case,
+        body.actor,
+        "status_changed",
+        {"status": body.status, "previous_status": prev_status},
+    )
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("status_updated", {"case_id": case_id, "status": body.status, "actor": body.actor})
@@ -500,6 +581,7 @@ async def add_comment(case_id: str, body: CommentBody):
     case["comments"].append(comment)
     case["updated_at"] = _now()
     case["timeline"].append({"event": "comment_added", "at": _now(), "comment_id": comment["id"]})
+    _append_case_audit(case, body.author, "comment_added", {"comment_id": comment["id"]})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("comment_added", {"case_id": case_id, "comment": comment})
@@ -515,6 +597,7 @@ async def edit_comment(case_id: str, comment_id: str, body: CommentBody):
             comment["edited"] = True
             comment["edited_at"] = _now()
             case["updated_at"] = _now()
+            _append_case_audit(case, body.author, "comment_edited", {"comment_id": comment_id})
             CASES[case_id] = case
             await _persist_case(case_id, case)
             return comment
@@ -529,6 +612,7 @@ async def delete_comment(case_id: str, comment_id: str):
     if len(case["comments"]) == before:
         raise HTTPException(status_code=404, detail="Comment not found")
     case["updated_at"] = _now()
+    _append_case_audit(case, "system", "comment_deleted", {"comment_id": comment_id})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     return {"status": "deleted", "comment_id": comment_id}
@@ -547,6 +631,7 @@ async def add_task(case_id: str, body: TaskBody):
     case["tasks"].append(task)
     case["updated_at"] = _now()
     case["timeline"].append({"event": "task_added", "at": _now(), "task_id": task["id"]})
+    _append_case_audit(case, "system", "task_added", {"task_id": task["id"], "title": task["title"]})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("task_added", {"case_id": case_id, "task": task})
@@ -558,10 +643,17 @@ async def update_task(case_id: str, task_id: str, body: TaskStatusBody):
     case = await get_case(case_id)
     for task in case.get("tasks", []):
         if task["id"] == task_id:
+            prev = task.get("status")
             task["status"] = body.status
             task["updated_at"] = _now()
             case["updated_at"] = _now()
             case["timeline"].append({"event": "task_updated", "at": _now(), "task_id": task_id, "status": body.status})
+            _append_case_audit(
+                case,
+                body.actor or "system",
+                "task_status_changed",
+                {"task_id": task_id, "status": body.status, "previous_status": prev},
+            )
             CASES[case_id] = case
             await _persist_case(case_id, case)
             return task
@@ -576,9 +668,33 @@ async def delete_task(case_id: str, task_id: str):
     if len(case["tasks"]) == before:
         raise HTTPException(status_code=404, detail="Task not found")
     case["updated_at"] = _now()
+    _append_case_audit(case, "system", "task_deleted", {"task_id": task_id})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     return {"status": "deleted", "task_id": task_id}
+
+
+@app.patch("/cases/{case_id}/soc-meta")
+async def patch_soc_meta(case_id: str, body: SocMetaPatch):
+    """SOC operational fields: incident taxonomy, legal hold, shift handover notes."""
+    _validate_case_id(case_id)
+    case = await get_case(case_id)
+    changes: dict[str, Any] = {}
+    if body.incident_category is not None:
+        changes["incident_category"] = {"from": case.get("incident_category"), "to": body.incident_category}
+        case["incident_category"] = body.incident_category
+    if body.legal_hold is not None:
+        changes["legal_hold"] = {"from": case.get("legal_hold"), "to": body.legal_hold}
+        case["legal_hold"] = bool(body.legal_hold)
+    if body.shift_handover_notes is not None:
+        changes["shift_handover_notes"] = True
+        case["shift_handover_notes"] = body.shift_handover_notes
+    if changes:
+        case["updated_at"] = _now()
+        _append_case_audit(case, body.actor, "soc_meta_changed", changes)
+    CASES[case_id] = case
+    await _persist_case(case_id, case)
+    return case
 
 
 @app.post("/cases/{case_id}/evidence")
@@ -633,6 +749,12 @@ async def upload_evidence(
     case["timeline"].append(
         {"event": "evidence_uploaded", "at": _now(), "evidence_id": evidence_id, "filename": orig_name}
     )
+    _append_case_audit(
+        case,
+        (uploaded_by or "").strip()[:200] or "system",
+        "evidence_uploaded",
+        {"evidence_id": evidence_id, "filename": orig_name, "size": total},
+    )
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit(
@@ -674,12 +796,18 @@ async def delete_evidence(case_id: str, evidence_id: str):
     meta = next((e for e in case["evidence"] if e.get("id") == eid), None)
     if not meta:
         raise HTTPException(status_code=404, detail="Evidence not found")
+    if case.get("legal_hold"):
+        raise HTTPException(
+            status_code=423,
+            detail="Legal hold is active — evidence cannot be deleted until hold is cleared.",
+        )
     path = _resolved_evidence_path(case_id, str(meta["stored_name"]))
     if path.is_file():
         path.unlink()
     case["evidence"] = [e for e in case["evidence"] if e.get("id") != eid]
     case["updated_at"] = _now()
     case["timeline"].append({"event": "evidence_removed", "at": _now(), "evidence_id": eid})
+    _append_case_audit(case, "system", "evidence_deleted", {"evidence_id": eid, "filename": meta.get("filename")})
     CASES[case_id] = case
     await _persist_case(case_id, case)
     return {"status": "deleted", "evidence_id": eid}
@@ -754,6 +882,8 @@ async def link_case(case_id: str, body: CaseLinkBody):
     b["updated_at"] = now
     a["timeline"].append({"event": "case_linked", "at": now, "target_case_id": target, "by": act})
     b["timeline"].append({"event": "case_linked", "at": now, "target_case_id": case_id, "by": act})
+    _append_case_audit(a, act, "case_linked", {"target_case_id": target})
+    _append_case_audit(b, act, "case_linked", {"target_case_id": case_id})
     CASES[case_id] = a
     CASES[target] = b
     await _persist_case(case_id, a)

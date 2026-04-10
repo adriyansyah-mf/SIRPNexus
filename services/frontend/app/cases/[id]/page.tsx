@@ -5,6 +5,7 @@ import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
 import { openctiKnowledgeSearchUrl } from '../../../lib/openctiLinks';
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import CaseInvestigation from './CaseInvestigation';
+import CaseSocTab from './CaseSocTab';
 
 type CaseEvidence = {
   id: string;
@@ -36,6 +37,10 @@ type Case = {
   observables?: { type: string; value: string }[];
   evidence?: CaseEvidence[];
   linked_case_ids?: string[];
+  audit_events?: { at?: string; actor?: string; action?: string; detail?: Record<string, unknown> }[];
+  incident_category?: string | null;
+  legal_hold?: boolean;
+  shift_handover_notes?: string | null;
 };
 
 type SourceAlertPreview = {
@@ -254,7 +259,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
   const [tab, setTab] = useState<
-    'overview' | 'investigation' | 'evidence' | 'tasks' | 'comments' | 'timeline' | 'observables'
+    'overview' | 'investigation' | 'soc' | 'evidence' | 'tasks' | 'comments' | 'timeline' | 'observables'
   >('overview');
   const [evidenceUploading, setEvidenceUploading] = useState(false);
   const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
@@ -279,6 +284,35 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     if (!res.ok) return;
     const data = await res.json();
     setC(data);
+  };
+
+  const exportCaseJson = async () => {
+    if (!token) {
+      notify('Sign in to export', false);
+      return;
+    }
+    try {
+      const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/export`, {
+        cache: 'no-store',
+        headers: { authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        notify(`Export failed (${res.status})`, false);
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `case-${params.id}-export.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      notify('Export downloaded');
+    } catch {
+      notify('Export failed', false);
+    }
   };
 
   useEffect(() => {
@@ -491,10 +525,19 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   const deleteEvidence = async (eid: string) => {
     if (!window.confirm('Remove this evidence file?')) return;
-    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}`, {
+    const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}`, {
       method: 'DELETE',
       headers: token ? { authorization: `Bearer ${token}` } : {},
     });
+    if (res.status === 423) {
+      const d = (await res.json().catch(() => ({}))) as { detail?: string };
+      notify(typeof d.detail === 'string' ? d.detail : 'Legal hold blocks deletion', false);
+      return;
+    }
+    if (!res.ok) {
+      notify(`Remove failed (${res.status})`, false);
+      return;
+    }
     notify('Evidence removed');
     load();
   };
@@ -531,15 +574,18 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
             <option value="resolved">resolved</option>
             <option value="closed">closed</option>
           </select>
+          <button type="button" onClick={() => void exportCaseJson()} style={{ fontSize: 12 }}>
+            Export JSON
+          </button>
           <button onClick={load}>↻ Refresh</button>
         </div>
       </div>
 
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 16, flexWrap: 'wrap' }}>
-        {(['overview', 'investigation', 'evidence', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
+        {(['overview', 'investigation', 'soc', 'evidence', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
           <button key={t} style={tabStyle(t)} onClick={() => setTab(t)}>
-            {t === 'evidence' ? 'Evidence' : t === 'investigation' ? 'Investigation' : t.charAt(0).toUpperCase() + t.slice(1)}
+            {t === 'evidence' ? 'Evidence' : t === 'investigation' ? 'Investigation' : t === 'soc' ? 'SOC' : t.charAt(0).toUpperCase() + t.slice(1)}
             {t === 'tasks' && c.tasks?.length ? ` (${c.tasks.length})` : ''}
             {t === 'comments' && c.comments?.length ? ` (${c.comments.length})` : ''}
             {t === 'evidence' && c.evidence?.length ? ` (${c.evidence.length})` : ''}
@@ -755,6 +801,21 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                     ),
                   ],
                   [
+                    'Incident category',
+                    <span>
+                      {c.incident_category ? <span className="badge badge-info">{c.incident_category}</span> : '—'}
+                      <span className="text-muted" style={{ fontSize: 11, marginLeft: 8 }}>Edit in <strong>SOC</strong> tab</span>
+                    </span>,
+                  ],
+                  [
+                    'Legal hold',
+                    c.legal_hold ? (
+                      <span><span className="badge badge-high">Active</span> — evidence deletion blocked</span>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  [
                     'Linked cases',
                     <div>
                       {(c.linked_case_ids || []).length ? (
@@ -776,11 +837,12 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                   [
                     'Alert ID',
                     c.alert_id ? (
-                      <div className="flex gap-2 items-start" style={{ flexWrap: 'wrap' }}>
+                      <div className="flex gap-2 items-start flex-wrap">
                         <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{c.alert_id}</span>
                         <button type="button" style={{ fontSize: 11 }} onClick={() => copyText('Alert ID', c.alert_id!)}>
                           Copy
                         </button>
+                        <Link href={`/alerts/${c.alert_id}`} style={{ fontSize: 12 }}>Open alert</Link>
                       </div>
                     ) : (
                       '—'
@@ -891,6 +953,18 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
       {tab === 'investigation' && (
         <CaseInvestigation caseId={params.id} alertId={c.alert_id || null} onRefreshCase={() => void load()} />
+      )}
+
+      {tab === 'soc' && (
+        <CaseSocTab
+          caseId={params.id}
+          incidentCategory={c.incident_category}
+          legalHold={c.legal_hold}
+          shiftHandoverNotes={c.shift_handover_notes}
+          auditEvents={c.audit_events}
+          token={token}
+          onRefresh={() => void load()}
+        />
       )}
 
       {/* Evidence */}

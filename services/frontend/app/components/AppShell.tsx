@@ -8,11 +8,13 @@ import UtcClock from './UtcClock';
 const INTERNAL_NAV = [
   { label: 'Dashboard', href: '/' },
   { label: 'Search', href: '/search' },
+  { label: 'Hunting', href: '/hunting' },
   { label: 'Alerts', href: '/alerts' },
   { label: 'Cases', href: '/cases' },
   { label: 'Observables', href: '/observables' },
   { label: 'Playbooks', href: '/playbooks' },
   { label: 'Statistics', href: '/statistics' },
+  { label: 'Operations', href: '/operations' },
   { label: 'Audit', href: '/audit' },
   { label: 'Admin', href: '/admin' },
 ] as const;

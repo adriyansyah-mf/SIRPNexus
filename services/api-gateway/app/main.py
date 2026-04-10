@@ -5,6 +5,8 @@ import os
 import re
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
 
@@ -161,6 +163,32 @@ async def _get_pool() -> asyncpg.Pool:
         )
         await _user_pool.execute(
             "CREATE INDEX IF NOT EXISTS sirp_audit_log_actor_idx ON sirp_audit_log (actor)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_saved_hunts (
+                id TEXT PRIMARY KEY,
+                owner_username TEXT NOT NULL,
+                label TEXT NOT NULL,
+                query TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_saved_hunts_owner_idx ON sirp_saved_hunts (owner_username, created_at DESC)"
+        )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_ops_snapshots (
+                id BIGSERIAL PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                snapshot JSONB NOT NULL
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_ops_snapshots_created_idx ON sirp_ops_snapshots (created_at DESC)"
         )
         existing = await _user_pool.fetchval("SELECT count(*) FROM sirp_users")
         if existing == 0:
@@ -648,6 +676,291 @@ async def global_search(request: Request, q: str, limit_per: int = 20):
             obs_hits.append({"kind": "observable", "id": oid, "title": f"{typ}: {val}", "subtitle": val})
 
     return {"query": qn, "cases": case_hits[:cap], "alerts": alert_hits[:cap], "observables": obs_hits[:cap]}
+
+
+def _soc_risk_score(a: dict[str, Any]) -> int:
+    if isinstance(a.get("risk_score"), int):
+        return int(a["risk_score"])
+    sev = str(a.get("severity", "")).lower()
+    base = {"low": 18, "medium": 42, "high": 68, "critical": 92}.get(sev, 38)
+    obs = a.get("observables") or []
+    n_obs = len(obs) if isinstance(obs, list) else 0
+    tags = a.get("tags") or []
+    n_tags = len(tags) if isinstance(tags, list) else 0
+    bonus = min(28, n_obs * 4 + min(8, n_tags * 2))
+    return min(100, base + bonus)
+
+
+@app.get("/soc/summary")
+async def soc_summary(request: Request):
+    """Aggregated operational metrics for SOC dashboards (alerts + cases)."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    claims = _decode_token(auth.split(" ", 1)[1])
+    _require_role(claims, {"analyst", "responder", "admin", "readonly"})
+    headers: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+    base_cases = SERVICE_MAP["cases"].rstrip("/")
+    base_alerts = SERVICE_MAP["alerts"].rstrip("/")
+    async with httpx.AsyncClient(timeout=60) as client:
+        ra, rc = await asyncio.gather(
+            client.get(f"{base_alerts}/alerts", headers=headers),
+            client.get(f"{base_cases}/cases", headers=headers),
+        )
+    alerts: list[Any] = []
+    cases: list[Any] = []
+    if ra.status_code == 200:
+        try:
+            data = ra.json()
+            if isinstance(data, list):
+                alerts = data
+        except Exception:
+            pass
+    if rc.status_code == 200:
+        try:
+            data = rc.json()
+            if isinstance(data, list):
+                cases = data
+        except Exception:
+            pass
+
+    alerts_open = 0
+    alerts_critical = 0
+    risk_sum = 0
+    by_source: dict[str, int] = {}
+    for a in alerts:
+        if not isinstance(a, dict):
+            continue
+        st = str(a.get("status", "")).lower()
+        if st != "closed":
+            alerts_open += 1
+        if str(a.get("severity", "")).lower() == "critical":
+            alerts_critical += 1
+        risk_sum += _soc_risk_score(a)
+        src = str(a.get("source") or "unknown")
+        by_source[src] = by_source.get(src, 0) + 1
+    n_alerts = len(alerts)
+    avg_risk = round(risk_sum / n_alerts, 1) if n_alerts else 0.0
+
+    cases_open = 0
+    legal_holds = 0
+    mttr_samples: list[float] = []
+    by_category: dict[str, int] = {}
+    for c in cases:
+        if not isinstance(c, dict):
+            continue
+        st = str(c.get("status", "")).lower()
+        if st not in {"resolved", "closed"}:
+            cases_open += 1
+        if c.get("legal_hold"):
+            legal_holds += 1
+        cat = c.get("incident_category")
+        if cat:
+            ck = str(cat)
+            by_category[ck] = by_category.get(ck, 0) + 1
+        if st in {"resolved", "closed"}:
+            ca = c.get("created_at")
+            ua = c.get("updated_at")
+            if ca and ua:
+                try:
+                    t0 = datetime.fromisoformat(str(ca).replace("Z", "+00:00")).timestamp()
+                    t1 = datetime.fromisoformat(str(ua).replace("Z", "+00:00")).timestamp()
+                    mttr_samples.append(max(0.0, (t1 - t0) / 3600.0))
+                except Exception:
+                    pass
+    mttr_hours = round(sum(mttr_samples) / len(mttr_samples), 2) if mttr_samples else None
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "alerts": {
+            "total": n_alerts,
+            "open": alerts_open,
+            "critical": alerts_critical,
+            "avg_risk_score": avg_risk,
+            "by_source": by_source,
+        },
+        "cases": {
+            "total": len(cases),
+            "open": cases_open,
+            "legal_hold": legal_holds,
+            "mttr_resolved_hours": mttr_hours,
+            "incident_categories": by_category,
+        },
+    }
+
+
+def _soc_auth_claims_and_user(request: Request) -> tuple[dict, str]:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    claims = _decode_token(auth.split(" ", 1)[1])
+    _require_role(claims, {"analyst", "responder", "admin", "readonly"})
+    user = str(claims.get("preferred_username") or claims.get("sub") or "").strip() or "user"
+    return claims, user
+
+
+def _soc_auth_user(request: Request) -> str:
+    _, user = _soc_auth_claims_and_user(request)
+    return user
+
+
+@app.get("/soc/hunting/queries")
+async def list_saved_hunts(request: Request):
+    """Per-user saved hunt queries (persisted in gateway Postgres)."""
+    user = _soc_auth_user(request)
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT id, label, query, created_at FROM sirp_saved_hunts WHERE owner_username = $1 "
+        "ORDER BY created_at DESC LIMIT 100",
+        user,
+    )
+    return [
+        {
+            "id": r["id"],
+            "label": r["label"],
+            "query": r["query"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@app.post("/soc/hunting/queries")
+async def create_saved_hunt(request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Saving hunts requires analyst role or above")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    label = str((body or {}).get("label") or "").strip()[:200]
+    query = str((body or {}).get("query") or "").strip()[:2000]
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="query must be at least 2 characters")
+    if not label:
+        label = query[:80]
+    hid = str(uuid.uuid4())
+    pool = await _get_pool()
+    await pool.execute(
+        "INSERT INTO sirp_saved_hunts (id, owner_username, label, query) VALUES ($1, $2, $3, $4)",
+        hid,
+        user,
+        label,
+        query,
+    )
+    return {"id": hid, "label": label, "query": query}
+
+
+@app.delete("/soc/hunting/queries/{hunt_id}")
+async def delete_saved_hunt(hunt_id: str, request: Request):
+    claims, user = _soc_auth_claims_and_user(request)
+    if not _require_role_soft(claims, {"analyst", "responder", "admin"}):
+        raise HTTPException(status_code=403, detail="Deleting hunts requires analyst role or above")
+    hid = hunt_id.strip()
+    if not hid or len(hid) > 80:
+        raise HTTPException(status_code=400, detail="Invalid hunt id")
+    pool = await _get_pool()
+    result = await pool.execute("DELETE FROM sirp_saved_hunts WHERE id = $1 AND owner_username = $2", hid, user)
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Saved hunt not found")
+    return {"status": "deleted", "id": hid}
+
+
+async def _maybe_record_ops_snapshot(pool: asyncpg.Pool, out: dict[str, Any]) -> None:
+    """Append throttled ops snapshots for uptime-style history (max ~1 / 3 min)."""
+    try:
+        last = await pool.fetchval("SELECT max(created_at) FROM sirp_ops_snapshots")
+        now = datetime.now(timezone.utc)
+        if last is not None:
+            lu = last if last.tzinfo else last.replace(tzinfo=timezone.utc)
+            if (now - lu).total_seconds() < 180:
+                return
+        await pool.execute(
+            "INSERT INTO sirp_ops_snapshots (snapshot) VALUES ($1::jsonb)",
+            json.dumps(out),
+        )
+        await pool.execute(
+            """
+            DELETE FROM sirp_ops_snapshots a
+            USING (
+                SELECT id FROM sirp_ops_snapshots ORDER BY created_at DESC OFFSET 400
+            ) AS old WHERE a.id = old.id
+            """
+        )
+    except Exception as exc:
+        logger.warning("ops snapshot insert/trim failed: %s", exc)
+
+
+@app.get("/soc/ops-status")
+async def soc_ops_status(request: Request):
+    """Reachability of core microservices (for SOC operations wallboard)."""
+    _soc_auth_user(request)
+    ih: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        ih["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+    checks: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=6) as client:
+        for name, base in SERVICE_MAP.items():
+            t0 = time.perf_counter()
+            ok = False
+            err: str | None = None
+            try:
+                r = await client.get(f"{base.rstrip('/')}/health", headers=ih)
+                ok = r.status_code == 200
+            except Exception as exc:
+                err = str(exc)[:160]
+            checks.append(
+                {
+                    "service": name,
+                    "ok": ok,
+                    "ms": round((time.perf_counter() - t0) * 1000, 1),
+                    "error": err,
+                }
+            )
+    db_ok = True
+    pool = await _get_pool()
+    try:
+        await pool.fetchval("SELECT 1")
+    except Exception:
+        db_ok = False
+    out: dict[str, Any] = {
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gateway_database": {"ok": db_ok},
+        "services": checks,
+    }
+    await _maybe_record_ops_snapshot(pool, out)
+    return out
+
+
+@app.get("/soc/ops-history")
+async def soc_ops_history(request: Request, limit: int = 40):
+    """Recent recorded ops-status snapshots (same auth as ops-status)."""
+    _soc_auth_user(request)
+    lim = max(1, min(int(limit), 200))
+    pool = await _get_pool()
+    rows = await pool.fetch(
+        "SELECT id, created_at, snapshot FROM sirp_ops_snapshots ORDER BY created_at DESC LIMIT $1",
+        lim,
+    )
+    items: list[dict[str, Any]] = []
+    for r in rows:
+        snap = r["snapshot"]
+        if isinstance(snap, str):
+            try:
+                snap = json.loads(snap)
+            except Exception:
+                snap = {}
+        items.append(
+            {
+                "id": r["id"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "snapshot": snap if isinstance(snap, dict) else {},
+            }
+        )
+    return {"items": items}
 
 
 # ── Inbound SIEM ingest (no gateway rate limit; token + alert-service allowlist) ─

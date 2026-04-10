@@ -17,3 +17,5 @@ htmlcov/
 .vscode/
 *.log
 .DS_Store
+.agents/
+plugins/
