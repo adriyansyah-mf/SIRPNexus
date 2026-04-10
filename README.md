@@ -157,6 +157,7 @@ bash infra/kafka/create-topics.sh
   - Status lifecycle: `POST /alerts/alerts/{alert_id}/status` (`new|triaged|escalated|closed`)
   - Escalate: `POST /alerts/alerts/{alert_id}/escalate`
 - Case actions:
+  - Create manually (no alert): `POST /cases/cases` with JSON `title`, optional `description`, `severity`, `owner`, `tags`
   - Create from alert: `POST /cases/cases/from-alert`
   - Assignment tracking (`assigned_by`, `assigned_to`, `assigned_at`)
   - Ownership enforcement (owner/admin for status updates)

@@ -352,6 +352,29 @@ def _normalize_sentinel(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _opencti_entity_observables(entity: dict[str, Any]) -> list[dict[str, str]]:
+    """Map STIX cyber-observable entity to IOC list for Kafka observables.created."""
+    val = entity.get("observable_value") or entity.get("name")
+    if not val or not str(val).strip():
+        return []
+    et = str(entity.get("entity_type") or "").upper()
+    if "IPV4" in et or "IPV6" in et or et.endswith("IP"):
+        t = "ip"
+    elif "DOMAIN" in et:
+        t = "domain"
+    elif "HOST" in et or "HOSTNAME" in et:
+        t = "hostname"
+    elif "URL" in et:
+        t = "url"
+    elif "EMAIL" in et:
+        t = "email"
+    elif "FILE" in et or "HASH" in et or "STIXFILE" in et or "ARTIFACT" in et:
+        t = "hash"
+    else:
+        t = "other"
+    return [{"type": t, "value": str(val).strip()[:800]}]
+
+
 def _normalize_opencti(entity: dict[str, Any]) -> dict[str, Any]:
     entity_type = entity.get("entity_type", "Stix-Cyber-Observable")
     description = entity.get("x_opencti_description") or entity.get("description") or ""
@@ -365,6 +388,7 @@ def _normalize_opencti(entity: dict[str, Any]) -> dict[str, Any]:
         "description": description[:2000],
         "raw": entity,
         "tags": ["opencti", entity_type.lower(), *labels],
+        "observables": _opencti_entity_observables(entity),
     }
 
 

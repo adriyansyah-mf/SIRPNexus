@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime, timezone
 
@@ -23,6 +24,8 @@ OBSERVABLES: list[dict] = []
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 ELASTIC = os.getenv("ELASTICSEARCH_URL", "http://elasticsearch:9200")
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+logger = logging.getLogger("sirp.observable")
 
 
 def _now() -> str:
@@ -78,11 +81,32 @@ async def enforce_internal_token(request: Request, call_next):
     return await call_next(request)
 
 
+# Must cover types emitted by alert-service (Wazuh field map + regex extraction + merges).
+_ALLOWED_IOC_TYPES = frozenset(
+    {
+        "ip",
+        "domain",
+        "url",
+        "hash",
+        "email",
+        "hostname",
+        "user",
+        "file",
+        "process",
+        "command",
+        "port",
+        "other",
+    }
+)
+
+
 def _validate_ioc(data: dict) -> None:
-    if data.get("type") not in {"ip", "domain", "url", "hash", "email"}:
-        raise HTTPException(status_code=400, detail="Unsupported IOC type")
+    t = (data.get("type") or "").strip().lower()
+    if t not in _ALLOWED_IOC_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported IOC type: {data.get('type')!r}")
     if not data.get("value"):
         raise HTTPException(status_code=400, detail="IOC value is required")
+    data["type"] = t
 
 
 @app.get("/observables")
@@ -109,12 +133,11 @@ async def create_observable(data: dict):
             doc_id,
             json.dumps(doc),
         )
-    await es.index(index="observables", document=doc)
+    try:
+        await es.index(index="observables", document=doc)
+    except Exception:
+        logger.warning("observable Elasticsearch index failed for %s (IOC still stored in DB)", doc_id, exc_info=True)
     return doc
-
-
-import logging
-logger = logging.getLogger("sirp.observable")
 
 
 async def worker():

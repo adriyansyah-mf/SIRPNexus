@@ -1,4 +1,5 @@
 import { serverFetchGateway } from '../../lib/serverGateway';
+import CreateCaseForm from './CreateCaseForm';
 
 type Case = {
   id: string;
@@ -55,6 +56,7 @@ export default async function CasesPage() {
           <h1>Cases</h1>
           <div className="page-meta">{open} open · {cases.length} total</div>
         </div>
+        <CreateCaseForm />
       </div>
 
       <table className="data-table">
@@ -91,7 +93,7 @@ export default async function CasesPage() {
             </tr>
           ))}
           {!cases.length && (
-            <tr><td colSpan={7}><div className="empty-state">No cases yet. Escalate an alert to create one.</div></td></tr>
+            <tr><td colSpan={7}><div className="empty-state">No cases yet. Use <strong>New case</strong> above or escalate an alert.</div></td></tr>
           )}
         </tbody>
       </table>

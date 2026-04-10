@@ -22,7 +22,20 @@ function relTime(ts?: string): string {
 }
 
 function typeBadge(t?: string) {
-  const colors: Record<string, string> = { ip: 'info', domain: 'medium', hash: 'high', email: 'low', url: 'medium' };
+  const colors: Record<string, string> = {
+    ip: 'info',
+    domain: 'medium',
+    hash: 'high',
+    email: 'low',
+    url: 'medium',
+    hostname: 'medium',
+    user: 'low',
+    file: 'high',
+    process: 'high',
+    command: 'high',
+    port: 'info',
+    other: 'new',
+  };
   const cls = colors[t?.toLowerCase() || ''] || 'info';
   return <span className={`badge badge-${cls}`}>{t || '—'}</span>;
 }

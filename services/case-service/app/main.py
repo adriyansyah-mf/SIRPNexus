@@ -180,6 +180,38 @@ class CaseCreate(BaseModel):
     owner: str = ""
     tags: list[str] = []
 
+    @field_validator("title", mode="before")
+    @classmethod
+    def title_ok(cls, v: Any) -> str:
+        if v is None or (isinstance(v, str) and not str(v).strip()):
+            raise ValueError("title is required")
+        return str(v).strip()[:500]
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def desc_ok(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)[:16000]
+
+    @field_validator("owner", mode="before")
+    @classmethod
+    def owner_ok(cls, v: Any) -> str:
+        return "" if v is None else str(v)[:200]
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def sev_ok(cls, v: Any) -> str:
+        s = str(v or "medium").lower()
+        return s if s in {"low", "medium", "high", "critical"} else "medium"
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def tags_ok(cls, v: Any) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        return [str(x) for x in v if x is not None][:64]
+
 
 class Assignment(BaseModel):
     assigned_to: str
@@ -327,8 +359,10 @@ def _build_case(case_id: str, title: str, description: str, severity: str = "med
 
 @app.post("/cases")
 async def create_case(body: CaseCreate):
+    """Create a case without linking an alert (manual / proactive SOC case)."""
     case_id = str(uuid.uuid4())
     case = _build_case(case_id, body.title, body.description, body.severity, body.owner, tags=body.tags)
+    case["timeline"] = [{"event": "case_created_manual", "at": _now()}]
     CASES[case_id] = case
     await _persist_case(case_id, case)
     await _emit("created", {"case": case})
