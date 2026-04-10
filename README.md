@@ -164,6 +164,13 @@ bash infra/kafka/create-topics.sh
   - Case lifecycle (`open|in-progress|resolved|closed`)
   - Timeline, comments, tasks
   - Evidence files: `POST /cases/cases/{id}/evidence` (multipart `file` + optional `uploaded_by`), download `GET …/evidence/{evidence_id}/file`, delete `DELETE …/evidence/{evidence_id}` — files on disk (`CASE_EVIDENCE_DIR`), metadata on case JSON; UI tab **Evidence** on case detail.
+  - **Case correlation & linking**: `GET /cases/cases/{id}/related` suggests other cases (IOC overlap + shared tags within a time window); `POST /cases/cases/{id}/link` links two cases bidirectionally (`linked_case_ids`). UI: case tab **Investigation** (related cases, optional related alerts when the case has `alert_id`, merged **investigation timeline**).
+  - **Merged investigation timeline**: `GET /cases/cases/{id}/investigation-timeline` combines case timeline, comments, tasks, evidence, and source alert (requires `ALERT_SERVICE_URL` on case-service).
+
+### Global search & audit (gateway)
+
+- **Search** (UI `/search`, API `GET /search?q=…`): one query across cases (title, description, tags, comments, evidence filenames), alerts, and observables; requires analyst/responder/admin/readonly JWT.
+- **Audit log** (UI `/audit`, API `GET /audit/events`): append-only table `sirp_audit_log` in gateway Postgres; records successful mutating proxy calls (method/path/status) and explicit admin user mutations. Query params: `limit`, `offset`, `actor`, `resource_type`. Rows are not updatable via the API.
 
 ## Security Controls
 
@@ -174,7 +181,7 @@ bash infra/kafka/create-topics.sh
 - Vault-ready deployment (`vault` service)
 - Centralized encrypted secret storage (`secret-service`) for runtime API keys
 - Field encryption at rest for sensitive case fields (`DATA_ENCRYPTION_KEY` / Fernet)
-- Audit trail through Kafka event history (`alerts.*`, `cases.updated`)
+- Audit trail: Kafka event history (`alerts.*`, `cases.updated`) plus **immutable gateway audit log** (`sirp_audit_log`, `GET /audit/events`)
 
 ## Admin Panel - API Keys
 
@@ -204,6 +211,7 @@ Supported runtime keys include SIEM, OpenCTI, SMTP, and webhook credentials (e.g
 
 ## FE/BE Integration Status
 
+- **Search** (`/search`) and **Audit** (`/audit`) in the main nav; case **Investigation** tab for related cases/alerts and merged timeline
 - Alerts page: assign, tag, status update, escalate to case
 - Observables page consumes live backend data from `GET /observables/observables`
 - OpenCTI: use `NEXT_PUBLIC_OPENCTI_URL` in the frontend for a nav link; server-side sync uses `OPENCTI_*` on alert-service

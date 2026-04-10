@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
+import httpx
 from aiokafka import AIOKafkaProducer
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -21,6 +22,7 @@ producer: AIOKafkaProducer | None = None
 db_pool: asyncpg.Pool | None = None
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+ALERT_SERVICE_URL = os.getenv("ALERT_SERVICE_URL", "http://alert-service:8001").rstrip("/")
 DATA_ENCRYPTION_KEY = os.getenv("DATA_ENCRYPTION_KEY", "")
 FERNET = Fernet(DATA_ENCRYPTION_KEY.encode()) if DATA_ENCRYPTION_KEY else None
 
@@ -239,6 +241,19 @@ class TaskStatusBody(BaseModel):
     actor: str = ""
 
 
+class CaseLinkBody(BaseModel):
+    target_case_id: str
+    actor: str = ""
+
+    @field_validator("target_case_id", mode="before")
+    @classmethod
+    def target_uuid(cls, v: Any) -> str:
+        s = str(v or "").strip()
+        if not _UUID_RE.match(s):
+            raise ValueError("invalid target case id")
+        return s
+
+
 @app.on_event("startup")
 async def startup():
     global producer, db_pool
@@ -301,6 +316,64 @@ async def list_cases():
     return list(CASES.values())
 
 
+async def _all_cases_decrypted() -> list[dict[str, Any]]:
+    if db_pool:
+        rows = await db_pool.fetch("SELECT payload FROM cases ORDER BY created_at DESC LIMIT 500")
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            p = r["payload"]
+            if isinstance(p, str):
+                try:
+                    p = json.loads(p)
+                except Exception:
+                    continue
+            if isinstance(p, dict):
+                out.append(_decrypt_case_payload(dict(p)))
+        return out
+    return [dict(_decrypt_case_payload(c)) for c in CASES.values()]
+
+
+def _obs_tuples(c: dict[str, Any]) -> set[tuple[str, str]]:
+    s: set[tuple[str, str]] = set()
+    for o in c.get("observables") or []:
+        if isinstance(o, dict) and o.get("value"):
+            s.add((str(o.get("type", "other")), str(o["value"])[:500]))
+    return s
+
+
+def _tags_lower(c: dict[str, Any]) -> set[str]:
+    return {str(t).lower() for t in (c.get("tags") or []) if t}
+
+
+def _within_case_window(iso_ts: str | None, days: int) -> bool:
+    if not iso_ts or days <= 0:
+        return True
+    try:
+        t = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t >= datetime.now(timezone.utc) - timedelta(days=days)
+    except Exception:
+        return True
+
+
+async def _fetch_alert_payload(alert_id: str) -> dict[str, Any] | None:
+    if not alert_id.strip():
+        return None
+    headers: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(f"{ALERT_SERVICE_URL}/alerts/{alert_id.strip()}", headers=headers)
+            if r.status_code != 200:
+                return None
+            body = r.json()
+            return body if isinstance(body, dict) else None
+    except Exception:
+        return None
+
+
 def _row_payload(row: asyncpg.Record | None) -> dict[str, Any] | None:
     if not row:
         return None
@@ -323,6 +396,8 @@ async def get_case(case_id: str):
         case = _row_payload(row)
     if not case:
         raise HTTPException(status_code=404, detail="Case not found")
+    case.setdefault("linked_case_ids", [])
+    case.setdefault("evidence", [])
     return case
 
 
@@ -354,6 +429,7 @@ def _build_case(case_id: str, title: str, description: str, severity: str = "med
         "created_at": _now(),
         "updated_at": _now(),
         "evidence": [],
+        "linked_case_ids": [],
     }
 
 
@@ -607,3 +683,147 @@ async def delete_evidence(case_id: str, evidence_id: str):
     CASES[case_id] = case
     await _persist_case(case_id, case)
     return {"status": "deleted", "evidence_id": eid}
+
+
+@app.get("/cases/{case_id}/related")
+async def related_cases(case_id: str, window_days: int = 14, limit: int = 15):
+    """Suggest other cases with overlapping IOCs (and bonus for shared tags) within a time window."""
+    _validate_case_id(case_id)
+    me = await get_case(case_id)
+    all_c = await _all_cases_decrypted()
+    limit = max(1, min(limit, 50))
+    window_days = max(0, min(window_days, 365))
+    scored: list[tuple[int, dict[str, Any]]] = []
+    o_me, t_me = _obs_tuples(me), _tags_lower(me)
+    for other in all_c:
+        oid = str(other.get("id", ""))
+        if oid == case_id:
+            continue
+        if not _within_case_window(other.get("created_at"), window_days):
+            continue
+        o_ot, t_ot = _obs_tuples(other), _tags_lower(other)
+        shared_o = o_me & o_ot
+        shared_t = t_me & t_ot
+        score = len(shared_o) * 10 + len(shared_t)
+        if score <= 0:
+            continue
+        reasons: list[str] = []
+        if shared_o:
+            reasons.append(f"{len(shared_o)} shared IOC(s)")
+        if shared_t:
+            reasons.append("tags: " + ", ".join(sorted(shared_t)[:6]))
+        scored.append(
+            (
+                score,
+                {
+                    "id": oid,
+                    "title": other.get("title") or oid,
+                    "score": score,
+                    "reasons": reasons,
+                    "created_at": other.get("created_at"),
+                },
+            )
+        )
+    scored.sort(key=lambda x: -x[0])
+    return {"related_cases": [x[1] for x in scored[:limit]]}
+
+
+@app.post("/cases/{case_id}/link")
+async def link_case(case_id: str, body: CaseLinkBody):
+    """Bidirectional link between two cases (metadata + timeline)."""
+    _validate_case_id(case_id)
+    target = body.target_case_id
+    if case_id == target:
+        raise HTTPException(status_code=400, detail="Cannot link a case to itself")
+    a = await get_case(case_id)
+    b = await get_case(target)
+    a.setdefault("linked_case_ids", [])
+    b.setdefault("linked_case_ids", [])
+    act = (body.actor or "").strip()[:200] or "system"
+    changed = False
+    if target not in a["linked_case_ids"]:
+        a["linked_case_ids"].append(target)
+        changed = True
+    if case_id not in b["linked_case_ids"]:
+        b["linked_case_ids"].append(case_id)
+        changed = True
+    if not changed:
+        return {"status": "already_linked", "case_id": case_id, "target_case_id": target}
+    now = _now()
+    a["updated_at"] = now
+    b["updated_at"] = now
+    a["timeline"].append({"event": "case_linked", "at": now, "target_case_id": target, "by": act})
+    b["timeline"].append({"event": "case_linked", "at": now, "target_case_id": case_id, "by": act})
+    CASES[case_id] = a
+    CASES[target] = b
+    await _persist_case(case_id, a)
+    await _persist_case(target, b)
+    await _emit("case_linked", {"case_id": case_id, "target_case_id": target, "actor": act})
+    return {"status": "linked", "case_id": case_id, "target_case_id": target}
+
+
+@app.get("/cases/{case_id}/investigation-timeline")
+async def investigation_timeline(case_id: str):
+    """Merged chronological view: timeline + comments + tasks + evidence + source alert."""
+    _validate_case_id(case_id)
+    case = await get_case(case_id)
+    ev: list[dict[str, Any]] = []
+    for t in case.get("timeline") or []:
+        if isinstance(t, dict):
+            ev.append(
+                {
+                    "at": t.get("at") or "",
+                    "kind": "timeline",
+                    "label": str(t.get("event", "event")),
+                    "detail": t,
+                }
+            )
+    for co in case.get("comments") or []:
+        if isinstance(co, dict):
+            txt = str(co.get("text") or "")
+            ev.append(
+                {
+                    "at": co.get("at") or "",
+                    "kind": "comment",
+                    "label": "comment",
+                    "detail": {"author": co.get("author"), "text": txt[:400]},
+                }
+            )
+    for tk in case.get("tasks") or []:
+        if isinstance(tk, dict):
+            ts = tk.get("updated_at") or tk.get("created_at") or ""
+            ev.append(
+                {
+                    "at": ts,
+                    "kind": "task",
+                    "label": f"task ({tk.get('status', '')})",
+                    "detail": {"title": tk.get("title"), "id": tk.get("id")},
+                }
+            )
+    for ei in case.get("evidence") or []:
+        if isinstance(ei, dict) and ei.get("uploaded_at"):
+            ev.append(
+                {
+                    "at": ei["uploaded_at"],
+                    "kind": "evidence",
+                    "label": "evidence",
+                    "detail": {"filename": ei.get("filename"), "id": ei.get("id")},
+                }
+            )
+    alt = await _fetch_alert_payload(str(case.get("alert_id") or ""))
+    if alt:
+        ev.append(
+            {
+                "at": alt.get("ingested_at") or alt.get("created_at") or "",
+                "kind": "source_alert",
+                "label": "source alert",
+                "detail": {
+                    "alert_id": case.get("alert_id"),
+                    "title": alt.get("title"),
+                    "severity": alt.get("severity"),
+                    "source": alt.get("source"),
+                },
+            }
+        )
+    ev.sort(key=lambda x: (x.get("at") or "", x.get("kind") or ""))
+    return {"events": ev}

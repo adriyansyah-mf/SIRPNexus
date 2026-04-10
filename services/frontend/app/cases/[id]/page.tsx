@@ -1,8 +1,10 @@
 'use client';
 
+import Link from 'next/link';
 import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
 import { openctiKnowledgeSearchUrl } from '../../../lib/openctiLinks';
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import CaseInvestigation from './CaseInvestigation';
 
 type CaseEvidence = {
   id: string;
@@ -31,6 +33,7 @@ type Case = {
   tasks?: { id: string; title: string; status: string; assigned_to?: string }[];
   observables?: { type: string; value: string }[];
   evidence?: CaseEvidence[];
+  linked_case_ids?: string[];
 };
 
 type OpenctiMatch = {
@@ -127,7 +130,9 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [commentText, setCommentText] = useState('');
   const [taskTitle, setTaskTitle] = useState('');
   const [taskAssignee, setTaskAssignee] = useState('');
-  const [tab, setTab] = useState<'overview' | 'evidence' | 'tasks' | 'comments' | 'timeline' | 'observables'>('overview');
+  const [tab, setTab] = useState<
+    'overview' | 'investigation' | 'evidence' | 'tasks' | 'comments' | 'timeline' | 'observables'
+  >('overview');
   const [evidenceUploading, setEvidenceUploading] = useState(false);
   const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
   const [intelModal, setIntelModal] = useState<IntelLookupModal | null>(null);
@@ -372,9 +377,9 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '1px solid var(--border-subtle)', marginBottom: 16, flexWrap: 'wrap' }}>
-        {(['overview', 'evidence', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
+        {(['overview', 'investigation', 'evidence', 'tasks', 'comments', 'timeline', 'observables'] as const).map((t) => (
           <button key={t} style={tabStyle(t)} onClick={() => setTab(t)}>
-            {t === 'evidence' ? 'Evidence' : t.charAt(0).toUpperCase() + t.slice(1)}
+            {t === 'evidence' ? 'Evidence' : t === 'investigation' ? 'Investigation' : t.charAt(0).toUpperCase() + t.slice(1)}
             {t === 'tasks' && c.tasks?.length ? ` (${c.tasks.length})` : ''}
             {t === 'comments' && c.comments?.length ? ` (${c.comments.length})` : ''}
             {t === 'evidence' && c.evidence?.length ? ` (${c.evidence.length})` : ''}
@@ -394,6 +399,20 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                 ['Owner', c.owner || '—'],
                 ['Assigned to', c.assigned_to || '—'],
                 ['Tags', (c.tags || []).map(t => <span key={t} className="tag">{t}</span>) || '—'],
+                [
+                  'Linked cases',
+                  (c.linked_case_ids || []).length ? (
+                    <span className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                      {(c.linked_case_ids || []).map((lid) => (
+                        <Link key={lid} href={`/cases/${lid}`} className="mono" style={{ fontSize: 12 }}>
+                          {lid.slice(0, 8)}…
+                        </Link>
+                      ))}
+                    </span>
+                  ) : (
+                    '—'
+                  ),
+                ],
                 ['Alert ID', c.alert_id ? <span className="mono">{c.alert_id.slice(0, 24)}…</span> : '—'],
                 ['SLA Response due', c.sla?.response_due ? relTime(c.sla.response_due) : '—'],
                 ['SLA Resolution due', c.sla?.resolution_due ? relTime(c.sla.resolution_due) : '—'],
@@ -409,6 +428,10 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
             </tbody>
           </table>
         </div>
+      )}
+
+      {tab === 'investigation' && (
+        <CaseInvestigation caseId={params.id} alertId={c.alert_id || null} onRefreshCase={() => void load()} />
       )}
 
       {/* Evidence */}

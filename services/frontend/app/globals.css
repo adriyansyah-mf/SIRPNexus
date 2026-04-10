@@ -128,6 +128,17 @@ a:hover { text-decoration: underline; }
   margin-top: 2px;
 }
 
+.search-hit-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.search-hit-list li {
+  margin-bottom: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
 /* ── Buttons ────────────────────────────────────────────────────────────────── */
 button, .btn {
   display: inline-flex;

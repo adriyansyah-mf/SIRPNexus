@@ -1,7 +1,11 @@
+import asyncio
+import json
 import logging
 import os
+import re
 import sys
 import time
+from typing import Any
 from urllib.parse import urljoin
 
 import asyncpg
@@ -136,6 +140,28 @@ async def _get_pool() -> asyncpg.Pool:
         await _user_pool.execute(
             "ALTER TABLE sirp_users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ"
         )
+        await _user_pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sirp_audit_log (
+                id BIGSERIAL PRIMARY KEY,
+                at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL DEFAULT 'mutation',
+                resource_type TEXT,
+                resource_id TEXT,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                status_code INT NOT NULL,
+                detail JSONB
+            )
+            """
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_audit_log_at_idx ON sirp_audit_log (at DESC)"
+        )
+        await _user_pool.execute(
+            "CREATE INDEX IF NOT EXISTS sirp_audit_log_actor_idx ON sirp_audit_log (actor)"
+        )
         existing = await _user_pool.fetchval("SELECT count(*) FROM sirp_users")
         if existing == 0:
             admin_user = os.getenv("INITIAL_ADMIN_USERNAME", "admin")
@@ -245,6 +271,50 @@ def _require_admin_from_request(request: Request) -> dict:
     return claims
 
 
+_UUID_RE = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}", re.I)
+
+
+async def _audit_append(
+    actor: str,
+    method: str,
+    path: str,
+    status_code: int,
+    resource_type: str | None,
+    resource_id: str | None,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Append-only audit row (never UPDATE/DELETE from application code)."""
+    try:
+        pool = await _get_pool()
+        await pool.execute(
+            "INSERT INTO sirp_audit_log(actor, action, resource_type, resource_id, method, path, status_code, detail) "
+            "VALUES($1, 'mutation', $2, $3, $4, $5, $6, $7::jsonb)",
+            actor[:200],
+            resource_type,
+            resource_id,
+            method,
+            path[:2000],
+            status_code,
+            json.dumps(detail or {}),
+        )
+    except Exception as exc:
+        logger.warning("audit log insert failed: %s", exc)
+
+
+def _audit_resource_from_proxy(service: str, path: str) -> tuple[str | None, str | None]:
+    m = _UUID_RE.search(path)
+    rid = m.group(0) if m else None
+    st = {
+        "cases": "case",
+        "alerts": "alert",
+        "observables": "observable",
+        "automation": "automation",
+        "secrets": "secret",
+        "notifications": "notification",
+    }.get(service)
+    return st, rid
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -327,7 +397,7 @@ async def list_users(request: Request):
 
 @app.post("/auth/users")
 async def create_user(request: Request):
-    _require_admin_from_request(request)
+    claims = _require_admin_from_request(request)
     body = await request.json()
     username = (body.get("username") or "").strip()
     password = (body.get("password") or "").strip()
@@ -348,12 +418,14 @@ async def create_user(request: Request):
         )
     except asyncpg.UniqueViolationError:
         raise HTTPException(status_code=409, detail=f"User '{username}' already exists")
+    actor = claims.get("preferred_username") or claims.get("sub") or "?"
+    await _audit_append(actor, "POST", "/auth/users", 200, "user", username, {"op": "user_create", "role": role})
     return {"username": username, "role": role, "status": "created"}
 
 
 @app.put("/auth/users/{username}/role")
 async def update_user_role(username: str, request: Request):
-    _require_admin_from_request(request)
+    claims = _require_admin_from_request(request)
     body = await request.json()
     role = (body.get("role") or "").strip().lower()
     if role not in VALID_ROLES:
@@ -365,6 +437,8 @@ async def update_user_role(username: str, request: Request):
     )
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+    actor = claims.get("preferred_username") or claims.get("sub") or "?"
+    await _audit_append(actor, "PUT", f"/auth/users/{username}/role", 200, "user", username, {"op": "role_change", "role": role})
     return {"username": username, "role": role, "status": "updated"}
 
 
@@ -387,18 +461,22 @@ async def update_user_password(username: str, request: Request):
     )
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+    actor = claims.get("preferred_username") or claims.get("sub") or "?"
+    await _audit_append(actor, "PUT", f"/auth/users/{username}/password", 200, "user", username, {"op": "password_reset"})
     return {"username": username, "status": "password updated"}
 
 
 @app.post("/auth/users/{username}/unlock")
 async def unlock_user(username: str, request: Request):
-    _require_admin_from_request(request)
+    claims = _require_admin_from_request(request)
     pool = await _get_pool()
     result = await pool.execute(
         "UPDATE sirp_users SET login_attempts=0, locked_until=NULL, updated_at=now() WHERE username=$1", username
     )
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+    actor = claims.get("preferred_username") or claims.get("sub") or "?"
+    await _audit_append(actor, "POST", f"/auth/users/{username}/unlock", 200, "user", username, {"op": "unlock"})
     return {"username": username, "status": "unlocked"}
 
 
@@ -411,7 +489,165 @@ async def delete_user(username: str, request: Request):
     result = await pool.execute("DELETE FROM sirp_users WHERE username=$1", username)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"User '{username}' not found")
+    actor = claims.get("preferred_username") or claims.get("sub") or "?"
+    await _audit_append(actor, "DELETE", f"/auth/users/{username}", 200, "user", username, {"op": "user_delete"})
     return {"username": username, "status": "deleted"}
+
+
+@app.get("/audit/events")
+async def list_audit_events(
+    request: Request,
+    limit: int = 100,
+    offset: int = 0,
+    actor: str | None = None,
+    resource_type: str | None = None,
+):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    claims = _decode_token(auth.split(" ", 1)[1])
+    _require_role(claims, {"admin", "analyst", "responder", "readonly"})
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    pool = await _get_pool()
+    where: list[str] = []
+    args: list[Any] = []
+    p = 0
+    if actor:
+        p += 1
+        args.append(actor)
+        where.append(f"actor = ${p}")
+    if resource_type:
+        p += 1
+        args.append(resource_type)
+        where.append(f"resource_type = ${p}")
+    p += 1
+    args.append(limit)
+    lim_p = p
+    p += 1
+    args.append(offset)
+    off_p = p
+    wh = ("WHERE " + " AND ".join(where)) if where else ""
+    rows = await pool.fetch(
+        f"SELECT id, at, actor, resource_type, resource_id, method, path, status_code, detail "
+        f"FROM sirp_audit_log {wh} ORDER BY at DESC LIMIT ${lim_p} OFFSET ${off_p}",
+        *args,
+    )
+    return [
+        {
+            "id": r["id"],
+            "at": r["at"].isoformat() if r["at"] else None,
+            "actor": r["actor"],
+            "resource_type": r["resource_type"],
+            "resource_id": r["resource_id"],
+            "method": r["method"],
+            "path": r["path"],
+            "status_code": r["status_code"],
+            "detail": r["detail"],
+        }
+        for r in rows
+    ]
+
+
+def _search_match(haystack: str, q: str) -> bool:
+    return q.lower() in haystack.lower()
+
+
+@app.get("/search")
+async def global_search(request: Request, q: str, limit_per: int = 20):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    claims = _decode_token(auth.split(" ", 1)[1])
+    _require_role(claims, {"analyst", "responder", "admin", "readonly"})
+    qn = (q or "").strip()
+    if len(qn) < 2:
+        raise HTTPException(status_code=400, detail="Query must be at least 2 characters")
+    cap = max(1, min(limit_per, 50))
+    headers: dict[str, str] = {}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
+
+    async def _get_json(url: str) -> list[Any]:
+        async with httpx.AsyncClient(timeout=45) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code != 200:
+                return []
+            try:
+                data = r.json()
+            except Exception:
+                return []
+            return data if isinstance(data, list) else []
+
+    base_cases = SERVICE_MAP["cases"].rstrip("/")
+    base_alerts = SERVICE_MAP["alerts"].rstrip("/")
+    base_obs = SERVICE_MAP["observables"].rstrip("/")
+    cases_raw, alerts_raw, obs_raw = await asyncio.gather(
+        _get_json(f"{base_cases}/cases"),
+        _get_json(f"{base_alerts}/alerts"),
+        _get_json(f"{base_obs}/observables"),
+    )
+
+    case_hits: list[dict[str, Any]] = []
+    for c in cases_raw:
+        if len(case_hits) >= cap:
+            break
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("id", ""))
+        title = str(c.get("title", ""))
+        desc = str(c.get("description", ""))
+        tags = " ".join(str(t) for t in (c.get("tags") or []))
+        comm = " ".join(
+            f"{x.get('author', '')} {x.get('text', '')}" for x in (c.get("comments") or []) if isinstance(x, dict)
+        )
+        ev_names = " ".join(str(e.get("filename", "")) for e in (c.get("evidence") or []) if isinstance(e, dict))
+        blob = f"{title} {desc} {tags} {comm} {ev_names}"
+        if _search_match(blob, qn) or _search_match(cid, qn):
+            case_hits.append(
+                {
+                    "kind": "case",
+                    "id": cid,
+                    "title": title or cid,
+                    "subtitle": (desc[:120] + "…") if len(desc) > 120 else desc,
+                }
+            )
+
+    alert_hits: list[dict[str, Any]] = []
+    for a in alerts_raw:
+        if len(alert_hits) >= cap:
+            break
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get("id", ""))
+        title = str(a.get("title", ""))
+        desc = str(a.get("description", ""))
+        tags = " ".join(str(t) for t in (a.get("tags") or []))
+        obs = " ".join(f"{o.get('type', '')}:{o.get('value', '')}" for o in (a.get("observables") or []) if isinstance(o, dict))
+        blob = f"{title} {desc} {tags} {obs}"
+        if _search_match(blob, qn) or _search_match(aid, qn):
+            alert_hits.append(
+                {
+                    "kind": "alert",
+                    "id": aid,
+                    "title": title or aid,
+                    "subtitle": str(a.get("source", "")) or (desc[:100] + "…") if len(desc) > 100 else desc,
+                }
+            )
+
+    obs_hits: list[dict[str, Any]] = []
+    for o in obs_raw:
+        if len(obs_hits) >= cap:
+            break
+        if not isinstance(o, dict):
+            continue
+        val = str(o.get("value", ""))
+        oid = str(o.get("id", val))
+        typ = str(o.get("type", ""))
+        if _search_match(val, qn) or _search_match(typ, qn) or _search_match(oid, qn):
+            obs_hits.append({"kind": "observable", "id": oid, "title": f"{typ}: {val}", "subtitle": val})
+
+    return {"query": qn, "cases": case_hits[:cap], "alerts": alert_hits[:cap], "observables": obs_hits[:cap]}
 
 
 # ── Inbound SIEM ingest (no gateway rate limit; token + alert-service allowlist) ─
@@ -512,6 +748,7 @@ async def proxy(service: str, path: str, request: Request):
     if service in AUTH_REQUIRED and not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization required")
 
+    claims: dict | None = None
     if auth.startswith("Bearer "):
         claims = _decode_token(auth.split(" ", 1)[1])
         # readonly can read alerts + observables; analyst/responder/admin can mutate
@@ -539,4 +776,18 @@ async def proxy(service: str, path: str, request: Request):
             raise HTTPException(status_code=502, detail=f"Upstream '{service}' unreachable") from exc
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Upstream '{service}' request failed") from exc
+
+    if claims and request.method in ("POST", "PUT", "PATCH", "DELETE") and 200 <= resp.status_code < 400:
+        actor = claims.get("preferred_username") or claims.get("sub") or "?"
+        rtype, rid = _audit_resource_from_proxy(service, path)
+        await _audit_append(
+            actor,
+            request.method,
+            str(request.url.path),
+            resp.status_code,
+            rtype,
+            rid,
+            {"upstream": service, "path": path[:400]},
+        )
+
     return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))

@@ -1036,8 +1036,7 @@ async def delete_alert(alert_id: str):
     return {"status": "deleted", "id": alert_id, "title": alert.get("title")}
 
 
-@app.get("/alerts")
-async def list_alerts():
+async def _all_alerts_payloads() -> list[dict[str, Any]]:
     if db_pool:
         rows = await db_pool.fetch("SELECT payload FROM alerts ORDER BY created_at DESC LIMIT 1000")
         out: list[dict[str, Any]] = []
@@ -1053,7 +1052,49 @@ async def list_alerts():
                 except Exception:
                     continue
         return out
-    return ALERTS
+    return list(ALERTS)
+
+
+@app.get("/alerts")
+async def list_alerts():
+    return await _all_alerts_payloads()
+
+
+@app.get("/alerts/{alert_id}/related")
+async def related_alerts(alert_id: str, limit: int = 25):
+    """Other alerts that share at least one observable value (type-insensitive match on value)."""
+    me = await _get_alert_or_404(alert_id)
+    obs_me = {
+        (str(o.get("type", "other")), str(o.get("value", ""))[:500])
+        for o in (me.get("observables") or [])
+        if isinstance(o, dict) and o.get("value")
+    }
+    if not obs_me:
+        return {"alerts": []}
+    limit = max(1, min(limit, 100))
+    hits: list[dict[str, Any]] = []
+    for a in await _all_alerts_payloads():
+        aid = str(a.get("id", ""))
+        if aid == alert_id:
+            continue
+        o2 = {
+            (str(o.get("type", "other")), str(o.get("value", ""))[:500])
+            for o in (a.get("observables") or [])
+            if isinstance(o, dict) and o.get("value")
+        }
+        shared = obs_me & o2
+        if shared:
+            hits.append(
+                {
+                    "id": aid,
+                    "title": a.get("title"),
+                    "overlap": len(shared),
+                    "created_at": a.get("created_at"),
+                    "source": a.get("source"),
+                }
+            )
+    hits.sort(key=lambda x: -int(x.get("overlap") or 0))
+    return {"alerts": hits[:limit]}
 
 
 @app.post("/alerts/{alert_id}/assign")
