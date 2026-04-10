@@ -22,7 +22,9 @@ type Case = {
   status?: string;
   severity?: string;
   owner?: string;
-  assigned_to?: string;
+  assigned_to?: string | null;
+  assigned_by?: string | null;
+  assigned_at?: string | null;
   created_at?: string;
   updated_at?: string;
   alert_id?: string;
@@ -34,6 +36,20 @@ type Case = {
   observables?: { type: string; value: string }[];
   evidence?: CaseEvidence[];
   linked_case_ids?: string[];
+};
+
+type SourceAlertPreview = {
+  id: string;
+  title?: string;
+  description?: string;
+  summary?: string;
+  severity?: string;
+  source?: string;
+  status?: string;
+  created_at?: string;
+  location?: string;
+  agent?: { id?: string; name?: string; ip?: string };
+  rule_ref?: { id?: string | number; level?: number; description?: string; groups?: string[] | string };
 };
 
 type OpenctiMatch = {
@@ -105,6 +121,113 @@ function relTime(ts?: string) {
 
 const OPENCTI_URL = (process.env.NEXT_PUBLIC_OPENCTI_URL || '').trim();
 
+const MITRE_TAG_RE = /^T\d{4}(?:\.\d{3})?$/i;
+
+function mitreTechniqueUrl(tag: string): string {
+  const t = tag.trim().toUpperCase();
+  const m = t.match(/^T(\d{4})(?:\.(\d{3}))?$/);
+  if (!m) return 'https://attack.mitre.org/';
+  const base = `https://attack.mitre.org/techniques/T${m[1]}`;
+  return m[2] ? `${base}/${m[2]}/` : `${base}/`;
+}
+
+function partitionMitreTags(tags: string[]): { mitre: string[]; other: string[] } {
+  const mitre: string[] = [];
+  const other: string[] = [];
+  for (const t of tags) {
+    if (MITRE_TAG_RE.test(t.trim())) mitre.push(t.trim());
+    else other.push(t);
+  }
+  return { mitre, other };
+}
+
+function parseDescriptionHints(text: string): { label: string; value: string }[] {
+  const patterns: [string, RegExp][] = [
+    ['Rule ID', /^Rule ID:\s*(.+)$/im],
+    ['Agent / endpoint', /^Agent \/ endpoint:\s*(.+)$/im],
+    ['Source IP', /^Source IP:\s*(.+)$/im],
+    ['Destination IP', /^Destination IP:\s*(.+)$/im],
+    ['URL', /^URL:\s*(.+)$/im],
+    ['User', /^User:\s*(.+)$/im],
+    ['MD5', /^MD5:\s*(.+)$/im],
+    ['SHA256', /^SHA256:\s*(.+)$/im],
+    ['Hostname', /^Hostname:\s*(.+)$/im],
+  ];
+  const out: { label: string; value: string }[] = [];
+  for (const [label, re] of patterns) {
+    const m = text.match(re);
+    if (m?.[1]) out.push({ label, value: m[1].trim() });
+  }
+  return out;
+}
+
+function formatUtc(ts?: string): string {
+  if (!ts) return '—';
+  const ms = Date.parse(ts);
+  if (Number.isNaN(ms)) return ts;
+  return new Date(ms).toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC');
+}
+
+function sourceAlertAgentLine(a?: SourceAlertPreview['agent']): string {
+  if (!a) return '';
+  const parts: string[] = [];
+  if (a.name) parts.push(String(a.name));
+  if (a.ip) parts.push(String(a.ip));
+  if (a.id !== undefined && a.id !== '') parts.push(`id ${a.id}`);
+  return parts.join(' · ');
+}
+
+function openTaskCount(tasks: Case['tasks']): number {
+  return (tasks || []).filter((t) => String(t.status || '').toLowerCase() !== 'done').length;
+}
+
+function evidenceTotalBytes(ev: CaseEvidence[] | undefined): number {
+  return (ev || []).reduce((s, e) => s + (typeof e.size === 'number' ? e.size : 0), 0);
+}
+
+function OverviewHintValue({
+  label,
+  value,
+  onOpenObservables,
+}: {
+  label: string;
+  value: string;
+  onOpenObservables: () => void;
+}) {
+  const isUrl = label === 'URL' || /^https?:\/\//i.test(value);
+  const v = value.trim();
+  if (isUrl) {
+    const href = v.startsWith('http') ? v : `https://${v}`;
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer" className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>
+        {value}
+      </a>
+    );
+  }
+  if (label === 'Source IP' || label === 'Destination IP') {
+    return (
+      <button
+        type="button"
+        onClick={onOpenObservables}
+        className="mono"
+        style={{
+          fontSize: 12,
+          background: 'var(--bg-elevated)',
+          border: '1px solid var(--border-subtle)',
+          borderRadius: 4,
+          padding: '2px 8px',
+          cursor: 'pointer',
+          color: 'var(--accent-blue)',
+        }}
+        title="Open Observables tab"
+      >
+        {value}
+      </button>
+    );
+  }
+  return <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{value}</span>;
+}
+
 function formatBytes(n?: number): string {
   if (n == null || Number.isNaN(n)) return '—';
   if (n < 1024) return `${n} B`;
@@ -136,6 +259,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [evidenceUploading, setEvidenceUploading] = useState(false);
   const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
   const [intelModal, setIntelModal] = useState<IntelLookupModal | null>(null);
+  const [sourceAlert, setSourceAlert] = useState<SourceAlertPreview | null>(null);
+  const [sourceAlertErr, setSourceAlertErr] = useState('');
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
 
   const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
@@ -156,7 +281,42 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     setC(data);
   };
 
-  useEffect(() => { load(); }, [params.id]);
+  useEffect(() => {
+    void load();
+  }, [params.id, token]);
+
+  useEffect(() => {
+    if (!c?.alert_id || !token) {
+      setSourceAlert(null);
+      setSourceAlertErr('');
+      return;
+    }
+    let cancelled = false;
+    setSourceAlert(null);
+    setSourceAlertErr('');
+    (async () => {
+      try {
+        const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}`, {
+          cache: 'no-store',
+          headers: { authorization: `Bearer ${token}` },
+        });
+        if (cancelled) return;
+        if (!res.ok) {
+          setSourceAlertErr(
+            res.status === 404 ? 'Alert not found (may have been purged).' : `Could not load alert (${res.status}).`,
+          );
+          return;
+        }
+        const data = (await res.json()) as SourceAlertPreview;
+        if (!cancelled) setSourceAlert(data);
+      } catch {
+        if (!cancelled) setSourceAlertErr('Could not load source alert.');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [c?.alert_id, c?.id, token]);
 
   const runIntelLookup = async (o: { type: string; value: string }, source: IntelSource) => {
     setIntelModal({
@@ -388,47 +548,346 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       </div>
 
       {/* Overview */}
-      {tab === 'overview' && (
-        <div>
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-            <tbody>
-              {[
-                ['Case ID', <span className="mono">{c.id}</span>],
-                ['Severity', sevBadge(c.severity)],
-                ['Status', statusBadge(c.status)],
-                ['Owner', c.owner || '—'],
-                ['Assigned to', c.assigned_to || '—'],
-                ['Tags', (c.tags || []).map(t => <span key={t} className="tag">{t}</span>) || '—'],
+      {tab === 'overview' && (() => {
+        const { mitre: mitreTags, other: otherTags } = partitionMitreTags(c.tags || []);
+        const descHints = parseDescriptionHints(c.description || '');
+        const lastTimeline = c.timeline?.length ? c.timeline[c.timeline.length - 1] : null;
+        const obsCount = c.observables?.length ?? 0;
+        const evCount = c.evidence?.length ?? 0;
+        const evBytes = evidenceTotalBytes(c.evidence);
+        const taskOpen = openTaskCount(c.tasks);
+        const taskTotal = c.tasks?.length ?? 0;
+        const commentCount = c.comments?.length ?? 0;
+
+        const copyText = (label: string, text: string) => {
+          void navigator.clipboard.writeText(text).then(
+            () => notify(`${label} copied`),
+            () => notify('Copy failed', false),
+          );
+        };
+
+        const slaDueCell = (due?: string) =>
+          !due ? (
+            '—'
+          ) : (
+            <span>
+              <span title={formatUtc(due)}>{relTime(due)}</span>
+              <span className="text-muted" style={{ fontSize: 11, marginLeft: 8 }}>{formatUtc(due)}</span>
+            </span>
+          );
+
+        return (
+          <div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 20 }}>
+              {(
                 [
-                  'Linked cases',
-                  (c.linked_case_ids || []).length ? (
-                    <span className="flex gap-2" style={{ flexWrap: 'wrap' }}>
-                      {(c.linked_case_ids || []).map((lid) => (
-                        <Link key={lid} href={`/cases/${lid}`} className="mono" style={{ fontSize: 12 }}>
-                          {lid.slice(0, 8)}…
-                        </Link>
-                      ))}
-                    </span>
-                  ) : (
-                    '—'
-                  ),
-                ],
-                ['Alert ID', c.alert_id ? <span className="mono">{c.alert_id.slice(0, 24)}…</span> : '—'],
-                ['SLA Response due', c.sla?.response_due ? relTime(c.sla.response_due) : '—'],
-                ['SLA Resolution due', c.sla?.resolution_due ? relTime(c.sla.resolution_due) : '—'],
-                ['Created', c.created_at || '—'],
-                ['Last updated', c.updated_at || '—'],
-                ['Description', <span style={{ whiteSpace: 'pre-wrap' }}>{c.description || '—'}</span>],
-              ].map(([k, v]) => (
-                <tr key={String(k)} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
-                  <td style={{ padding: '7px 0', width: 150, color: 'var(--text-muted)', verticalAlign: 'top' }}>{k}</td>
-                  <td style={{ padding: '7px 0' }}>{v}</td>
-                </tr>
+                  ['Observables', obsCount, 'observables' as const],
+                  ['Evidence', `${evCount} · ${formatBytes(evBytes)}`, 'evidence' as const],
+                  ['Tasks', `${taskOpen} open / ${taskTotal}`, 'tasks' as const],
+                  ['Comments', commentCount, 'comments' as const],
+                ] as const
+              ).map(([label, val, target]) => (
+                <button
+                  key={label}
+                  type="button"
+                  className="card"
+                  style={{
+                    padding: '12px 16px',
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    minWidth: 130,
+                    border: '1px solid var(--border-subtle)',
+                  }}
+                  onClick={() => setTab(target)}
+                >
+                  <div className="text-muted" style={{ fontSize: 11 }}>{label}</div>
+                  <div style={{ fontSize: 17, fontWeight: 600 }}>{val}</div>
+                </button>
               ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+            </div>
+
+            {c.alert_id ? (
+              <div className="card mb-4" style={{ padding: 14 }}>
+                <div className="card-title mb-2">Source alert</div>
+                {sourceAlertErr ? (
+                  <div style={{ fontSize: 13, color: 'var(--sev-high)' }}>{sourceAlertErr}</div>
+                ) : null}
+                {!sourceAlert && !sourceAlertErr ? (
+                  <div className="text-muted" style={{ fontSize: 13 }}>Loading alert…</div>
+                ) : null}
+                {sourceAlert ? (
+                  <div style={{ fontSize: 13, display: 'grid', gap: 8 }}>
+                    <div className="flex gap-2 flex-wrap items-center">
+                      {sevBadge(sourceAlert.severity)}
+                      {statusBadge(sourceAlert.status)}
+                      {sourceAlert.source ? <span className="badge badge-info">{sourceAlert.source}</span> : null}
+                      <span className="text-muted" style={{ fontSize: 12 }}>ingested {relTime(sourceAlert.created_at)}</span>
+                    </div>
+                    <div style={{ fontWeight: 600 }}>{sourceAlert.title || '—'}</div>
+                    {sourceAlert.rule_ref?.id !== undefined && sourceAlert.rule_ref.id !== '' ? (
+                      <div className="text-muted" style={{ fontSize: 12 }}>
+                        Rule <span className="mono">{String(sourceAlert.rule_ref.id)}</span>
+                        {sourceAlert.rule_ref.level != null ? ` · level ${sourceAlert.rule_ref.level}` : ''}
+                        {sourceAlert.rule_ref.description ? ` · ${sourceAlert.rule_ref.description}` : ''}
+                      </div>
+                    ) : null}
+                    {sourceAlertAgentLine(sourceAlert.agent) ? (
+                      <div className="text-muted" style={{ fontSize: 12 }}>
+                        Agent: <span className="mono">{sourceAlertAgentLine(sourceAlert.agent)}</span>
+                      </div>
+                    ) : null}
+                    {sourceAlert.location ? (
+                      <div className="text-muted mono" style={{ fontSize: 12 }}>Location: {sourceAlert.location}</div>
+                    ) : null}
+                    {(sourceAlert.summary || sourceAlert.description) ? (
+                      <div style={{ whiteSpace: 'pre-wrap', fontSize: 12, color: 'var(--text-secondary)' }}>
+                        {(sourceAlert.summary || sourceAlert.description || '').slice(0, 800)}
+                        {(sourceAlert.summary || sourceAlert.description || '').length > 800 ? '…' : ''}
+                      </div>
+                    ) : null}
+                    <div className="flex gap-2 flex-wrap">
+                      <Link href="/alerts" style={{ fontSize: 12 }}>Open Alerts list</Link>
+                      <button type="button" style={{ fontSize: 12 }} onClick={() => copyText('Alert ID', c.alert_id!)}>
+                        Copy alert ID
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {descHints.length > 0 ? (
+              <div className="card mb-4" style={{ padding: 14 }}>
+                <div className="card-title mb-2">Parsed from description</div>
+                <p className="text-muted mb-3" style={{ fontSize: 12 }}>
+                  Key-value lines detected in the case description (IPs link to the Observables tab).
+                </p>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                  <tbody>
+                    {descHints.map((h) => (
+                      <tr key={`${h.label}:${h.value}`} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                        <td style={{ padding: '6px 12px 6px 0', width: 140, color: 'var(--text-muted)', verticalAlign: 'top' }}>
+                          {h.label}
+                        </td>
+                        <td style={{ padding: '6px 0' }}>
+                          <OverviewHintValue
+                            label={h.label}
+                            value={h.value}
+                            onOpenObservables={() => setTab('observables')}
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <tbody>
+                {[
+                  [
+                    'Case ID',
+                    <div className="flex gap-2 items-start" style={{ flexWrap: 'wrap' }}>
+                      <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{c.id}</span>
+                      <button type="button" style={{ fontSize: 11 }} onClick={() => copyText('Case ID', c.id)}>
+                        Copy
+                      </button>
+                    </div>,
+                  ],
+                  ['Origin', c.alert_id ? 'Escalated from alert' : 'Created manually'],
+                  ['Severity', sevBadge(c.severity)],
+                  ['Status', statusBadge(c.status)],
+                  ['Owner', c.owner || '—'],
+                  [
+                    'Assigned to',
+                    c.assigned_to ? (
+                      <div>
+                        <div>{c.assigned_to}</div>
+                        {(c.assigned_by || c.assigned_at) ? (
+                          <div className="text-muted" style={{ fontSize: 11, marginTop: 4 }}>
+                            {c.assigned_by ? <>By <span className="mono">{c.assigned_by}</span></> : null}
+                            {c.assigned_at ? (
+                              <>
+                                {c.assigned_by ? ' · ' : null}
+                                {formatUtc(c.assigned_at)} <span className="text-muted">({relTime(c.assigned_at)})</span>
+                              </>
+                            ) : null}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  [
+                    'MITRE techniques',
+                    mitreTags.length ? (
+                      <span className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                        {mitreTags.map((t) => (
+                          <a
+                            key={t}
+                            href={mitreTechniqueUrl(t)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="tag"
+                            style={{ textDecoration: 'none' }}
+                            title="MITRE ATT&CK"
+                          >
+                            {t} ↗
+                          </a>
+                        ))}
+                      </span>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  [
+                    'Tags',
+                    otherTags.length ? (
+                      <span className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                        {otherTags.map((t) => (
+                          <span key={t} className="tag">{t}</span>
+                        ))}
+                      </span>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  [
+                    'Linked cases',
+                    <div>
+                      {(c.linked_case_ids || []).length ? (
+                        <span className="flex gap-2" style={{ flexWrap: 'wrap' }}>
+                          {(c.linked_case_ids || []).map((lid) => (
+                            <Link key={lid} href={`/cases/${lid}`} className="mono" style={{ fontSize: 12 }}>
+                              {lid.slice(0, 8)}…
+                            </Link>
+                          ))}
+                        </span>
+                      ) : (
+                        <span>—</span>
+                      )}
+                      <div className="text-muted" style={{ fontSize: 11, marginTop: 6 }}>
+                        Suggested correlations and linking live under the <strong>Investigation</strong> tab.
+                      </div>
+                    </div>,
+                  ],
+                  [
+                    'Alert ID',
+                    c.alert_id ? (
+                      <div className="flex gap-2 items-start" style={{ flexWrap: 'wrap' }}>
+                        <span className="mono" style={{ fontSize: 12, wordBreak: 'break-all' }}>{c.alert_id}</span>
+                        <button type="button" style={{ fontSize: 11 }} onClick={() => copyText('Alert ID', c.alert_id!)}>
+                          Copy
+                        </button>
+                      </div>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  [
+                    'Observables',
+                    <div className="flex gap-2 items-center flex-wrap">
+                      <span>{obsCount} IOC{obsCount === 1 ? '' : 's'}</span>
+                      {obsCount > 0 ? (
+                        <button type="button" className="btn-primary" style={{ fontSize: 11, padding: '4px 10px' }} onClick={() => setTab('observables')}>
+                          View observables
+                        </button>
+                      ) : null}
+                    </div>,
+                  ],
+                  [
+                    'Evidence',
+                    <div className="flex gap-2 items-center flex-wrap">
+                      <span>
+                        {evCount} file{evCount === 1 ? '' : 's'}
+                        {evBytes > 0 ? ` · ${formatBytes(evBytes)}` : ''}
+                      </span>
+                      {evCount > 0 ? (
+                        <button type="button" className="btn-primary" style={{ fontSize: 11, padding: '4px 10px' }} onClick={() => setTab('evidence')}>
+                          View evidence
+                        </button>
+                      ) : null}
+                    </div>,
+                  ],
+                  [
+                    'SLA',
+                    c.sla ? (
+                      <div>
+                        {c.sla.breached ? (
+                          <span className="badge badge-high" style={{ marginRight: 8 }}>breached</span>
+                        ) : (
+                          <span className="badge badge-resolved" style={{ marginRight: 8 }}>ok</span>
+                        )}
+                        <span className="text-muted" style={{ fontSize: 12 }}>
+                          Response and resolution targets below are shown in relative and absolute (UTC) time.
+                        </span>
+                      </div>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                  ['SLA response due', slaDueCell(c.sla?.response_due)],
+                  ['SLA resolution due', slaDueCell(c.sla?.resolution_due)],
+                  [
+                    'Created',
+                    <span>
+                      {formatUtc(c.created_at)}
+                      <span className="text-muted" style={{ fontSize: 11, marginLeft: 8 }}>({relTime(c.created_at)})</span>
+                    </span>,
+                  ],
+                  [
+                    'Last updated',
+                    <span>
+                      {formatUtc(c.updated_at)}
+                      <span className="text-muted" style={{ fontSize: 11, marginLeft: 8 }}>({relTime(c.updated_at)})</span>
+                    </span>,
+                  ],
+                  [
+                    'Last timeline event',
+                    lastTimeline ? (
+                      <span>
+                        <span style={{ fontWeight: 500 }}>{lastTimeline.event}</span>
+                        <span className="text-muted" style={{ fontSize: 12, marginLeft: 8 }}>
+                          {formatUtc(lastTimeline.at)} ({relTime(lastTimeline.at)})
+                        </span>
+                      </span>
+                    ) : (
+                      '—'
+                    ),
+                  ],
+                ].map(([k, v]) => (
+                  <tr key={String(k)} style={{ borderBottom: '1px solid var(--border-subtle)' }}>
+                    <td style={{ padding: '9px 0', width: 168, color: 'var(--text-muted)', verticalAlign: 'top' }}>{k}</td>
+                    <td style={{ padding: '9px 0' }}>{v}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            <div className="card mt-4" style={{ padding: 14 }}>
+              <div className="card-title mb-2">Full description</div>
+              {c.description ? (
+                <pre
+                  style={{
+                    margin: 0,
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    fontSize: 13,
+                    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                    color: 'var(--text-primary)',
+                  }}
+                >
+                  {c.description}
+                </pre>
+              ) : (
+                <div className="empty-state">No description.</div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
 
       {tab === 'investigation' && (
         <CaseInvestigation caseId={params.id} alertId={c.alert_id || null} onRefreshCase={() => void load()} />
