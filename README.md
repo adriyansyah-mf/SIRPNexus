@@ -23,6 +23,11 @@ OIDC + RBAC + rate limiting]
 - `docker-compose.prod.yml` - production baseline
 - Multi-stage Dockerfiles for all services
 
+### Kubernetes
+
+- **Supported**: all services are container images; inter-service URLs follow the same hostnames as Compose (e.g. `http://case-service:8001`) unless overridden by env.
+- **In-repo**: `k8s/base.yaml` is a **minimal example** (alert-service only). Full infra (Postgres, Kafka, Redis, ES, Keycloak, …) is expected to come from **managed services** or **Helm charts** — see **[k8s/README.md](k8s/README.md)** for checklist, secrets, Ingress/WebSocket notes, and `API_GATEWAY_URL` for case-service.
+
 Included runtime services:
 
 - `api-gateway`
@@ -156,6 +161,9 @@ bash infra/kafka/create-topics.sh
   - Add tags: `POST /alerts/alerts/{alert_id}/tags`
   - Status lifecycle: `POST /alerts/alerts/{alert_id}/status` (`new|triaged|escalated|closed`)
   - Escalate: `POST /alerts/alerts/{alert_id}/escalate`
+  - Delete one: `DELETE /alerts/alerts/{alert_id}`
+  - **Purge all**: `DELETE /alerts/alerts` (see [Alert service bulk delete](#alert-service-bulk-delete))
+  - **Risk score**: computed on alert read and exposed in UI/API for queue prioritization
 - Case actions:
   - Create manually (no alert): `POST /cases/cases` with JSON `title`, optional `description`, `severity`, `owner`, `tags`
   - Create from alert: `POST /cases/cases/from-alert`
@@ -166,6 +174,8 @@ bash infra/kafka/create-topics.sh
   - Evidence files: `POST /cases/cases/{id}/evidence` (multipart `file` + optional `uploaded_by`), download `GET …/evidence/{evidence_id}/file`, delete `DELETE …/evidence/{evidence_id}` — files on disk (`CASE_EVIDENCE_DIR`), metadata on case JSON; UI tab **Evidence** on case detail.
   - **Case correlation & linking**: `GET /cases/cases/{id}/related` suggests other cases (IOC overlap + shared tags within a time window); `POST /cases/cases/{id}/link` links two cases bidirectionally (`linked_case_ids`). UI: case tab **Investigation** (related cases, optional related alerts when the case has `alert_id`, merged **investigation timeline**).
   - **Merged investigation timeline**: `GET /cases/cases/{id}/investigation-timeline` combines case timeline, comments, tasks, evidence, and source alert (requires `ALERT_SERVICE_URL` on case-service).
+  - **SOC metadata** (gateway-proxied case routes): `incident_category`, `legal_hold`, `shift_handover_notes`, `audit_events` on the case payload; UI **SOC** tab.
+  - **Export**: `GET /cases/cases/{id}/export` — full case JSON for audit/handover; UI downloads via gateway; optional **custody** log entry from UI.
 
 ### Global search & audit (gateway)
 
@@ -197,24 +207,84 @@ Supported runtime keys include SIEM, OpenCTI, SMTP, and webhook credentials (e.g
 
 ## Real-Time Operations (Phase 2)
 
-- WebSocket event stream endpoint: `GET ws://<gateway>/stream/events`
-- Frontend live stream widget on Alerts and Cases pages
+- WebSocket event stream endpoint: `ws://<gateway>/stream/events` (JWT as query `token` or `Authorization` header)
+- Frontend **Live feed** widget on Alerts and Cases pages
 - Observable worker consumes `observables.created` and stores IOCs (dedupe + Elasticsearch index)
 
-## Phase 3 Additions
+## Phase 3 — Notifications
 
-- Notification microservice:
-  - Kafka consumer on `cases.updated`
-  - SMTP, Slack webhook, and Discord webhook dispatch
-  - Test endpoint: `POST /notifications/notifications/test` via gateway
-- API Gateway routing now includes `notifications` service.
+- **notification-service**: Kafka consumer on `cases.updated`; dispatches **SMTP**, **Slack**, **Discord** when secrets are set
+- **Test ping** (analyst+): `POST /notifications/notifications/test` via gateway (`/notifications/notifications/test` from browser with Bearer JWT)
+- **@mention ping** (internal): `POST /notifications/mentions` — used by the gateway when case comments contain `@username`
+- Gateway routes the `notifications` service (always forwards `x-internal-token` when configured)
 
-## FE/BE Integration Status
+## SOC — Gateway APIs & Postgres (`/soc/*`)
 
-- **Search** (`/search`) and **Audit** (`/audit`) in the main nav; case **Investigation** tab for related cases/alerts and merged timeline
-- Alerts page: assign, tag, status update, escalate to case
-- Observables page consumes live backend data from `GET /observables/observables`
-- OpenCTI: use `NEXT_PUBLIC_OPENCTI_URL` in the frontend for a nav link; server-side sync uses `OPENCTI_*` on alert-service
+All routes below are on the **API gateway** (prefix as proxied from UI: `/sirp-api/...`). They require a Bearer JWT unless noted.
+
+| Area | Method | Path | Notes |
+|------|--------|------|--------|
+| Summary | GET | `/soc/summary` | Aggregated alert/case metrics for dashboards |
+| Hunting (saved) | GET/POST/DELETE | `/soc/hunting/queries`, `/soc/hunting/queries/{id}` | Per-user saved queries in `sirp_saved_hunts` |
+| Ops health | GET | `/soc/ops-status` | Health of each `SERVICE_MAP` service + gateway DB |
+| Ops history | GET | `/soc/ops-history` | Throttled snapshots in `sirp_ops_snapshots` (~1 row / 3 min when polled) |
+| Notification config | GET | `/soc/notification-delivery-status` | Which channel **keys** exist in secret-service (no values) |
+| Chain of custody | POST/GET | `/soc/custody-log` | Append-only `sirp_chain_of_custody` |
+| Shift handover | POST/GET | `/soc/shift-report`, `/soc/shift-reports` | Structured reports in `sirp_shift_reports` |
+| Case watchlist | POST/DELETE/GET | `/soc/watchlist`, `/soc/watchlist/{case_id}` | `sirp_case_watchers` |
+| Mentions (UI) | GET | `/soc/mentions/for-me` | Rows for the logged-in username |
+| Mentions (internal) | POST | `/soc/internal/mentions/ingest` | **`x-internal-token` only** — called by case-service |
+| Watcher ping (internal) | POST | `/soc/internal/watchers/notify` | **`x-internal-token` only** — case updates → watchers |
+| Playbook approval | POST/GET | `/soc/playbook-run-requests` | Optional multi-step `approval_chain` JSON |
+| Approve / reject | POST | `/soc/playbook-run-requests/{id}/approve`, `.../reject` | Responder/admin; multi-step advances until automation runs |
+| Live investigation graph | GET | `/soc/investigation-graph` | `case_id` and/or `alert_id` — live upstream fetch |
+| IR bundle | GET | `/soc/investigation-bundle?case_id=` | Export + graph + custody tail; logs custody server-side |
+| Analytics+ | GET | `/soc/analytics-advanced` | Status distributions, unassigned counts, closure ratio |
+| Retro IOC | GET | `/soc/retro-hunt?q=` | Substring match over observable-service list (~1000 rows) |
+| Retro SIEM | GET | `/soc/retro-hunt/siem?q=` | Proxies to alert-service **Elasticsearch** search |
+| Intel hints | GET | `/soc/enrichment-hints?alert_id=` | Pivot hints (OpenCTI / AbuseIPDB) per alert IOCs |
+| Graph index | POST | `/soc/graph/reindex` | Admin JWT or internal token — fills `sirp_entity_edges` |
+| Graph query | GET | `/soc/graph/neighbors` | `focus_kind` + `focus_id` — read materialized edges |
+
+**case-service** calls the gateway when **`API_GATEWAY_URL`** and **`INTERNAL_SERVICE_TOKEN`** are set (e.g. `API_GATEWAY_URL=http://api-gateway:8000` in Docker Compose): **@mentions** ingest, **watcher** notifications on case events (`comment_added`, `status_updated`, `task_added`, etc.).
+
+## Alert service bulk delete
+
+- **`DELETE /alerts`** (via gateway: **`DELETE /alerts/alerts`**) — removes **all** alerts from Postgres, clears in-memory cache, and deletes Redis keys `alert:dedupe:*`. **Analyst+** only (same as other alert mutations). UI: Alerts page **Clear all alerts** (double confirm).
+
+## SIEM retro-search (Elasticsearch)
+
+- **alert-service**: **`GET /alerts/siem-retro-search`** (must be registered **before** `/alerts/{alert_id}`). Query params: `q`, `size`, optional `index`.
+- Default index env: **`ELASTIC_SIEM_INDEX`** (e.g. `wazuh-alerts-*`). Gateway exposes **`GET /soc/retro-hunt/siem`** for authenticated SOC users.
+
+## Frontend — routes & features
+
+| Path | Purpose |
+|------|---------|
+| `/` | Dashboard: KPIs, SOC summary, **platform health** (`/soc/ops-status`), recent alerts/cases |
+| `/search` | Global search |
+| `/hunting` | Saved queries: **browser** (localStorage) + **server** (`/soc/hunting/queries`) |
+| `/alerts` | List with filters, presets, **bulk** assign/tags/status/escalate, **Clear all alerts**, live feed |
+| `/alerts/[id]` | Alert detail, risk score, intel hooks |
+| `/cases` | Case list |
+| `/cases/[id]` | Tabs: overview, investigation, **SOC** (taxonomy, legal hold, handover), evidence, tasks, comments (**@mention**), timeline, observables; **Export JSON**, **Watch case**, link to IR center |
+| `/observables` | IOC list |
+| `/playbooks` | Automation playbooks & run history |
+| `/statistics` | Charts + MITRE-style heuristics from tags/titles |
+| `/operations` | Service health, auto-refresh, optional desktop notifications, ops snapshot history |
+| `/notifications` | Channel key status + **send test** (analyst+) |
+| `/ir-center` | **IR command center**: live/indexed graph, IR bundle download, shift reports, custody log, playbook approvals, @mentions inbox, analytics+, dual retro-hunt, watchlist, enrichment hints |
+| `/audit` | Gateway audit log |
+| `/admin` | Secrets / admin (admin role) |
+| `/login` | Local JWT login (`INITIAL_ADMIN_*`, `APP_AUTH_JWT_SECRET`) |
+
+Nav also includes **OpenCTI** when `NEXT_PUBLIC_OPENCTI_URL` is set. **Analyzers** route redirects to OpenCTI or `/`.
+
+## FE/BE integration checklist
+
+- **RBAC**: `readonly` can read most SOC data; **analyst/responder/admin** can mutate alerts, cases, hunting saves, custody logs, shift reports, watchlist, playbook requests, and **Clear all alerts**. **Responder/admin** approve playbook runs (per-step if `approval_chain` is set). **Admin** (or internal token) can **graph reindex**.
+- **Keycloak**: When using realm JWTs, align usernames with **`@mentions`** (`preferred_username`).
+- **Secrets** for notifications: `SMTP_*`, `NOTIFY_EMAIL_TO`, `SLACK_WEBHOOK_URL`, `DISCORD_WEBHOOK_URL` (via `/admin` → secret-service).
 
 ## Tests
 
