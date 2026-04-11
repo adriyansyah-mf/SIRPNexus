@@ -1125,6 +1125,28 @@ async def list_alerts():
     return out
 
 
+@app.delete("/alerts")
+async def delete_all_alerts():
+    """Remove every alert from Postgres, in-memory cache, and Redis dedupe keys."""
+    global ALERTS
+    n_db = 0
+    if db_pool:
+        n_db = int(await db_pool.fetchval("SELECT count(*) FROM alerts") or 0)
+        await db_pool.execute("DELETE FROM alerts")
+    ALERTS.clear()
+    redis_deleted = 0
+    if redis_client:
+        cursor = 0
+        while True:
+            cursor, keys = await redis_client.scan(cursor=cursor, match="alert:dedupe:*", count=400)
+            if keys:
+                await redis_client.delete(*keys)
+                redis_deleted += len(keys)
+            if cursor == 0:
+                break
+    return {"status": "purged", "removed_db": n_db, "redis_dedupe_keys_deleted": redis_deleted}
+
+
 @app.get("/alerts/{alert_id}/related")
 async def related_alerts(alert_id: str, limit: int = 25):
     """Other alerts that share at least one observable value (type-insensitive match on value)."""

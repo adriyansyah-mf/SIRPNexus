@@ -154,6 +154,31 @@ export default function AlertsPage() {
 
   useEffect(() => { load(); }, []);
 
+  const clearAllAlerts = async () => {
+    const t = localStorage.getItem('sirp_token') || '';
+    if (!t) {
+      notify('Sign in to clear alerts');
+      return;
+    }
+    const n = alerts.length;
+    if (!window.confirm(`Hapus SEMUA alert (${n} saat ini di daftar)? Tindakan ini permanen.`)) return;
+    if (!window.confirm('Konfirmasi sekali lagi: seluruh alert di database environment ini akan dihapus.')) return;
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts`, {
+      method: 'DELETE',
+      headers: { authorization: `Bearer ${t}` },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = typeof (data as { detail?: string }).detail === 'string' ? (data as { detail: string }).detail : `Gagal (${res.status})`;
+      notify(msg);
+      return;
+    }
+    setSelected(new Set());
+    const removed = (data as { removed_db?: number }).removed_db;
+    notify(typeof removed === 'number' ? `Berhasil menghapus ${removed} alert` : 'Semua alert dihapus');
+    load();
+  };
+
   const closeModal = () => { setModal(null); setModalInput(''); };
 
   const confirmModal = async () => {
@@ -322,6 +347,9 @@ export default function AlertsPage() {
         </div>
         <div className="flex gap-2 flex-wrap">
           <button type="button" onClick={saveViewPreset}>Save view</button>
+          <button type="button" className="btn-danger" onClick={() => void clearAllAlerts()}>
+            Clear all alerts
+          </button>
           <button onClick={load}>↻ Refresh</button>
         </div>
       </div>
