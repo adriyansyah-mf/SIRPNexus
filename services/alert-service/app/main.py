@@ -8,6 +8,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote, urlparse, urlunparse
 
 import asyncpg
 import httpx
@@ -53,6 +54,19 @@ if not INTERNAL_SERVICE_TOKEN and not ALLOW_INSECURE_NO_INTERNAL_TOKEN:
     )
 SECRET_SERVICE_URL = os.getenv("SECRET_SERVICE_URL", "http://secret-service:8001")
 ABUSEIPDB_API_BASE = os.getenv("ABUSEIPDB_API_BASE", "https://api.abuseipdb.com/api/v2").rstrip("/")
+
+
+def _redis_url() -> str:
+    """If REDIS_URL has no password in the netloc but Redis uses requirepass, inject REDIS_PASSWORD (default sirp)."""
+    raw = (os.getenv("REDIS_URL") or "").strip() or "redis://redis:6379/0"
+    p = urlparse(raw)
+    if "@" in (p.netloc or ""):
+        return raw
+    pw = (os.getenv("REDIS_PASSWORD") or "sirp").strip()
+    netloc = p.netloc or "redis:6379"
+    auth_netloc = f":{quote(pw, safe='')}@{netloc}"
+    path = p.path if p.path else "/0"
+    return urlunparse((p.scheme or "redis", auth_netloc, path, "", p.query, p.fragment))
 
 
 def _now() -> str:
@@ -964,7 +978,7 @@ async def startup():
     global producer, redis_client, es, db_pool, opencti_sync_task
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA)
     await producer.start()
-    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://:sirp@redis:6379/0"))
+    redis_client = Redis.from_url(_redis_url())
     es = AsyncElasticsearch(hosts=[ELASTIC_URL])
     db_pool = await asyncpg.create_pool(
         host=os.getenv("POSTGRES_HOST", "postgres"),

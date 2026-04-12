@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from urllib.parse import quote, urlparse, urlunparse
 
 import asyncpg
 from aiokafka import AIOKafkaConsumer
@@ -37,6 +38,19 @@ if not INTERNAL_SERVICE_TOKEN and not ALLOW_INSECURE_NO_INTERNAL_TOKEN:
 logger = logging.getLogger("sirp.observable")
 
 
+def _redis_url() -> str:
+    """If REDIS_URL has no password in the netloc but Redis uses requirepass, inject REDIS_PASSWORD (default sirp)."""
+    raw = (os.getenv("REDIS_URL") or "").strip() or "redis://redis:6379/0"
+    p = urlparse(raw)
+    if "@" in (p.netloc or ""):
+        return raw
+    pw = (os.getenv("REDIS_PASSWORD") or "sirp").strip()
+    netloc = p.netloc or "redis:6379"
+    auth_netloc = f":{quote(pw, safe='')}@{netloc}"
+    path = p.path if p.path else "/0"
+    return urlunparse((p.scheme or "redis", auth_netloc, path, "", p.query, p.fragment))
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,7 +60,7 @@ async def startup():
     global consumer, redis_client, es, db_pool
     consumer = AIOKafkaConsumer("observables.created", bootstrap_servers=KAFKA, group_id="observable-service")
     await consumer.start()
-    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://:sirp@redis:6379/0"))
+    redis_client = Redis.from_url(_redis_url())
     es = AsyncElasticsearch(hosts=[ELASTIC])
     db_pool = await asyncpg.create_pool(
         host=os.getenv("POSTGRES_HOST", "postgres"),
