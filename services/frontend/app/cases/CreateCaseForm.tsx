@@ -15,16 +15,11 @@ export default function CreateCaseForm() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!title.trim()) {
       setError('Title is required');
-      return;
-    }
-    if (!token) {
-      setError('Sign in to create a case');
       return;
     }
     setLoading(true);
@@ -35,8 +30,8 @@ export default function CreateCaseForm() {
       .filter(Boolean);
     const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
-        authorization: `Bearer ${token}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({

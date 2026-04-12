@@ -2,11 +2,19 @@ import { cookies } from 'next/headers';
 
 const SERVER_GATEWAY_URL = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
+function decodeCookieToken(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 /** Server Components: call gateway from the Next container with session cookie → Bearer. */
 export async function serverFetchGateway(path: string, init?: RequestInit): Promise<Response> {
   const token = cookies().get('sirp_token')?.value;
   const headers = new Headers(init?.headers);
-  if (token) headers.set('authorization', `Bearer ${token}`);
+  if (token) headers.set('authorization', `Bearer ${decodeCookieToken(token)}`);
   const p = path.startsWith('/') ? path : `/${path}`;
   return fetch(`${SERVER_GATEWAY_URL}${p}`, { ...init, headers, cache: 'no-store' });
 }

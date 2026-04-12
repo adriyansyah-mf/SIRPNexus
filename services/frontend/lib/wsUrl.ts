@@ -1,21 +1,19 @@
 /**
- * WebSocket URL for /stream/events (browser). Uses page hostname so remote access works.
+ * WebSocket URL for /stream/events (browser).
+ * Same origin as the UI: server.js proxies upgrades to API_GATEWAY_URL (cookie auth, no ?token=).
  */
-export function browserStreamEventsUrl(token: string): string {
+export function browserStreamEventsUrl(): string {
   const envWs = process.env.NEXT_PUBLIC_WS_URL?.trim();
-  let base: string;
   if (envWs) {
-    base = envWs.replace(/\/$/, '');
+    let base = envWs.replace(/\/$/, '');
     if (!base.includes('stream/events')) {
       base = `${base}/stream/events`;
     }
-  } else if (typeof window !== 'undefined') {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const port = process.env.NEXT_PUBLIC_GATEWAY_PORT || '8000';
-    base = `${proto}//${window.location.hostname}:${port}/stream/events`;
-  } else {
-    base = 'ws://127.0.0.1:8000/stream/events';
+    return base;
   }
-  const q = token ? `?token=${encodeURIComponent(token)}` : '';
-  return `${base}${q}`;
+  if (typeof window !== 'undefined') {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${proto}//${window.location.host}/stream/events`;
+  }
+  return 'ws://127.0.0.1:3000/stream/events';
 }

@@ -7,9 +7,10 @@ from pathlib import Path
 
 def _load_case_module():
     os.environ['DATA_ENCRYPTION_KEY'] = '9pc95JNaPykspfJ-GFBzf8d3crUxVLUehbhyGv3lE1Y='
+    os.environ['INTERNAL_SERVICE_TOKEN'] = 'test-internal-token'
     # Unit test only: stub asyncpg so the module can be imported without DB dependency.
     if 'asyncpg' not in sys.modules:
-        asyncpg_stub = types.SimpleNamespace(Pool=object, create_pool=None)
+        asyncpg_stub = types.SimpleNamespace(Pool=object, create_pool=None, Record=object)
         sys.modules['asyncpg'] = asyncpg_stub
     if 'aiokafka' not in sys.modules:
         aiokafka_stub = types.SimpleNamespace(AIOKafkaProducer=object)

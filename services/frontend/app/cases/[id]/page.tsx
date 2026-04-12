@@ -240,17 +240,6 @@ function formatBytes(n?: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function jwtPreferredUsername(token: string): string {
-  try {
-    const p = token.split('.')[1];
-    const json = atob(p.replace(/-/g, '+').replace(/_/g, '/'));
-    const o = JSON.parse(json) as { preferred_username?: string; sub?: string };
-    return o.preferred_username || o.sub || 'user';
-  } catch {
-    return 'user';
-  }
-}
-
 export default function CaseDetail({ params }: { params: { id: string } }) {
   const [c, setC] = useState<Case | null>(null);
   const [toast, setToast] = useState('');
@@ -267,9 +256,17 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [sourceAlert, setSourceAlert] = useState<SourceAlertPreview | null>(null);
   const [sourceAlertErr, setSourceAlertErr] = useState('');
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
+  const [sessionUser, setSessionUser] = useState<string | null>(null);
+  const postAuth: RequestInit = { credentials: 'include', headers: { 'content-type': 'application/json' } };
 
-  const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-  const authHdr = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  useEffect(() => {
+    void fetch(`${CLIENT_API_PREFIX}/auth/me`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { preferred_username?: string; sub?: string } | null) =>
+        setSessionUser(d ? (d.preferred_username || d.sub || 'user') : null),
+      )
+      .catch(() => setSessionUser(null));
+  }, []);
 
   const notify = (msg: string, ok = true) => {
     setToast(msg);
@@ -279,31 +276,28 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const load = async () => {
-    const h = token ? { authorization: `Bearer ${token}` } : {};
-    const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}`, { cache: 'no-store', headers: h });
+    const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}`, {
+      cache: 'no-store',
+      credentials: 'include',
+    });
     if (!res.ok) return;
     const data = await res.json();
     setC(data);
   };
 
   const logCustody = (action: string, detail?: Record<string, unknown>) => {
-    if (!token) return;
     void fetch(`${CLIENT_API_PREFIX}/soc/custody-log`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      ...postAuth,
       body: JSON.stringify({ action, case_id: params.id, detail: detail || {} }),
     }).catch(() => {});
   };
 
   const exportCaseJson = async () => {
-    if (!token) {
-      notify('Sign in to export', false);
-      return;
-    }
     try {
       const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/export`, {
         cache: 'no-store',
-        headers: { authorization: `Bearer ${token}` },
+        credentials: 'include',
       });
       if (!res.ok) {
         notify(`Export failed (${res.status})`, false);
@@ -326,13 +320,9 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const watchThisCase = async () => {
-    if (!token) {
-      notify('Sign in to watch', false);
-      return;
-    }
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/watchlist`, {
       method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      ...postAuth,
       body: JSON.stringify({ case_id: params.id }),
     });
     notify(res.ok ? 'Added to your IR watchlist' : 'Could not add watch', res.ok);
@@ -340,10 +330,10 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   useEffect(() => {
     void load();
-  }, [params.id, token]);
+  }, [params.id]);
 
   useEffect(() => {
-    if (!c?.alert_id || !token) {
+    if (!c?.alert_id) {
       setSourceAlert(null);
       setSourceAlertErr('');
       return;
@@ -355,7 +345,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
       try {
         const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${c.alert_id}`, {
           cache: 'no-store',
-          headers: { authorization: `Bearer ${token}` },
+          credentials: 'include',
         });
         if (cancelled) return;
         if (!res.ok) {
@@ -373,7 +363,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     return () => {
       cancelled = true;
     };
-  }, [c?.alert_id, c?.id, token]);
+  }, [c?.alert_id, c?.id]);
 
   const runIntelLookup = async (o: { type: string; value: string }, source: IntelSource) => {
     setIntelModal({
@@ -388,7 +378,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     if (source === 'abuseipdb') {
       const res = await fetch(`${CLIENT_API_PREFIX}/alerts/abuseipdb/lookup`, {
         method: 'POST',
-        headers: authHdr,
+        ...postAuth,
         body: JSON.stringify({ value: o.value, maxAgeInDays: 90 }),
       });
       const data = (await res.json().catch(() => ({}))) as AbuseipdbLookupResult & { detail?: string };
@@ -416,7 +406,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     }
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/opencti/lookup`, {
       method: 'POST',
-      headers: authHdr,
+      ...postAuth,
       body: JSON.stringify({ value: o.value, type: o.type, first: 25 }),
     });
     const data = (await res.json().catch(() => ({}))) as {
@@ -451,9 +441,10 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const setStatus = async (status: string) => {
-    const actor = token ? 'admin' : 'ui';
+    const actor = sessionUser ? 'admin' : 'ui';
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/status`, {
-      method: 'POST', headers: authHdr,
+      method: 'POST',
+      ...postAuth,
       body: JSON.stringify({ status, actor }),
     });
     notify(`Status → ${status}`);
@@ -462,9 +453,10 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   const addComment = async () => {
     if (!commentText.trim()) return;
-    const author = token ? 'analyst' : 'anonymous';
+    const author = sessionUser ? 'analyst' : 'anonymous';
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments`, {
-      method: 'POST', headers: authHdr,
+      method: 'POST',
+      ...postAuth,
       body: JSON.stringify({ author, text: commentText }),
     });
     setCommentText('');
@@ -473,7 +465,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const deleteComment = async (cid: string) => {
-    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments/${cid}`, { method: 'DELETE', headers: authHdr });
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/comments/${cid}`, { method: 'DELETE', ...postAuth });
     notify('Comment deleted');
     load();
   };
@@ -481,7 +473,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const addTask = async () => {
     if (!taskTitle.trim()) return;
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks`, {
-      method: 'POST', headers: authHdr,
+      method: 'POST',
+      ...postAuth,
       body: JSON.stringify({ title: taskTitle, assigned_to: taskAssignee }),
     });
     setTaskTitle(''); setTaskAssignee('');
@@ -491,7 +484,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   const updateTaskStatus = async (tid: string, status: string) => {
     await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks/${tid}`, {
-      method: 'PUT', headers: authHdr,
+      method: 'PUT',
+      ...postAuth,
       body: JSON.stringify({ status }),
     });
     notify(`Task → ${status}`);
@@ -499,7 +493,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   };
 
   const deleteTask = async (tid: string) => {
-    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks/${tid}`, { method: 'DELETE', headers: authHdr });
+    await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/tasks/${tid}`, { method: 'DELETE', ...postAuth });
     notify('Task deleted');
     load();
   };
@@ -510,11 +504,11 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     setEvidenceUploading(true);
     const fd = new FormData();
     fd.append('file', f);
-    fd.append('uploaded_by', token ? jwtPreferredUsername(token) : 'anonymous');
+    fd.append('uploaded_by', sessionUser || 'anonymous');
     try {
       const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence`, {
         method: 'POST',
-        headers: token ? { authorization: `Bearer ${token}` } : {},
+        credentials: 'include',
         body: fd,
       });
       const data = (await res.json().catch(() => ({}))) as { detail?: string };
@@ -531,7 +525,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
 
   const downloadEvidence = async (eid: string, filename: string) => {
     const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}/file`, {
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       notify(`Download failed (${res.status})`, false);
@@ -550,7 +544,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
     if (!window.confirm('Remove this evidence file?')) return;
     const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${params.id}/evidence/${eid}`, {
       method: 'DELETE',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (res.status === 423) {
       const d = (await res.json().catch(() => ({}))) as { detail?: string };
@@ -991,7 +985,6 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
           legalHold={c.legal_hold}
           shiftHandoverNotes={c.shift_handover_notes}
           auditEvents={c.audit_events}
-          token={token}
           onRefresh={() => void load()}
         />
       )}
@@ -1008,14 +1001,13 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
             <div className="flex gap-2" style={{ flexWrap: 'wrap', alignItems: 'center' }}>
               <input
                 type="file"
-                disabled={evidenceUploading || !token}
+                disabled={evidenceUploading}
                 onChange={(e) => {
                   void uploadEvidence(e.target.files);
                   e.target.value = '';
                 }}
               />
               {evidenceUploading && <span className="text-muted" style={{ fontSize: 13 }}>Uploading…</span>}
-              {!token && <span className="text-muted" style={{ fontSize: 13 }}>Sign in to upload.</span>}
             </div>
           </div>
           <table className="data-table">

@@ -13,8 +13,7 @@ export default function RealtimeFeed() {
   const [events, setEvents] = useState<StreamEvent[]>([]);
 
   useEffect(() => {
-    const token = localStorage.getItem('sirp_token') || '';
-    const ws = new WebSocket(browserStreamEventsUrl(token));
+    const ws = new WebSocket(browserStreamEventsUrl());
 
     ws.onmessage = (event) => {
       try {

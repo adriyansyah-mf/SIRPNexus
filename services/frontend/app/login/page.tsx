@@ -16,19 +16,17 @@ export default function LoginPage() {
     const resp = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
+      credentials: 'include',
       body: JSON.stringify({ username, password }),
     });
     const data = await resp.json().catch(() => ({}));
     setLoading(false);
 
-    if (!resp.ok || !data.access_token) {
+    if (!resp.ok || !data.ok) {
       setError(data.detail || 'Invalid credentials');
       return;
     }
 
-    localStorage.setItem('sirp_token', data.access_token);
-    // Also set a cookie so server-side middleware can enforce auth guards
-    document.cookie = `sirp_token=${data.access_token}; path=/; SameSite=Strict; max-age=28800`;
     const params = new URLSearchParams(window.location.search);
     window.location.href = params.get('next') || '/';
   };

@@ -26,7 +26,6 @@ export default function CaseSocTab({
   legalHold,
   shiftHandoverNotes,
   auditEvents,
-  token,
   onRefresh,
 }: {
   caseId: string;
@@ -34,7 +33,6 @@ export default function CaseSocTab({
   legalHold?: boolean;
   shiftHandoverNotes?: string | null;
   auditEvents?: AuditEvent[];
-  token: string;
   onRefresh: () => void;
 }) {
   const [cat, setCat] = useState(incidentCategory || '');
@@ -50,14 +48,13 @@ export default function CaseSocTab({
   }, [incidentCategory, legalHold, shiftHandoverNotes, caseId]);
 
   const saveMeta = useCallback(async () => {
-    if (!token) return;
     setSaving(true);
     setMsg('');
     try {
       const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/soc-meta`, {
         method: 'PATCH',
+        credentials: 'include',
         headers: {
-          authorization: `Bearer ${token}`,
           'content-type': 'application/json',
         },
         body: JSON.stringify({
@@ -77,7 +74,7 @@ export default function CaseSocTab({
     } finally {
       setSaving(false);
     }
-  }, [caseId, cat, hold, notes, token, onRefresh]);
+  }, [caseId, cat, hold, notes, onRefresh]);
 
   const exportHandover = () => {
     const lines = [
@@ -134,14 +131,13 @@ export default function CaseSocTab({
             />
           </label>
           <div className="flex gap-2 flex-wrap">
-            <button type="button" className="btn-primary" disabled={!token || saving} onClick={() => void saveMeta()}>
+            <button type="button" className="btn-primary" disabled={saving} onClick={() => void saveMeta()}>
               {saving ? 'Saving…' : 'Save SOC fields'}
             </button>
             <button type="button" onClick={exportHandover}>
               Copy handover to clipboard
             </button>
           </div>
-          {!token ? <span className="text-muted" style={{ fontSize: 12 }}>Sign in to save.</span> : null}
         </div>
       </div>
 

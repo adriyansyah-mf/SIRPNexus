@@ -45,8 +45,7 @@ export default function LiveFeed() {
   const reconnectRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
-    const token = localStorage.getItem('sirp_token') || '';
-    const url = browserStreamEventsUrl(token);
+    const url = browserStreamEventsUrl();
 
     const connect = () => {
       const ws = new WebSocket(url);

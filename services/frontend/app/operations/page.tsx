@@ -38,28 +38,16 @@ export default function OperationsPage() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [err, setErr] = useState('');
   const [loading, setLoading] = useState(true);
-  const [noToken, setNoToken] = useState(false);
   const [autoSec, setAutoSec] = useState(0);
   const [notifHint, setNotifHint] = useState('');
   const prevHealthyRef = useRef<boolean | null>(null);
 
   const load = useCallback(async () => {
-    const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-    if (!token) {
-      setData(null);
-      setHistory([]);
-      setErr('');
-      setNoToken(true);
-      setLoading(false);
-      return;
-    }
-    setNoToken(false);
     setLoading(true);
     setErr('');
-    const headers = { authorization: `Bearer ${token}` };
     const [res, hres] = await Promise.all([
-      fetch(`${CLIENT_API_PREFIX}/soc/ops-status`, { cache: 'no-store', headers }),
-      fetch(`${CLIENT_API_PREFIX}/soc/ops-history?limit=48`, { cache: 'no-store', headers }),
+      fetch(`${CLIENT_API_PREFIX}/soc/ops-status`, { cache: 'no-store', credentials: 'include' }),
+      fetch(`${CLIENT_API_PREFIX}/soc/ops-history?limit=48`, { cache: 'no-store', credentials: 'include' }),
     ]);
     if (!res.ok) {
       setErr(res.status === 401 ? 'Sign in required.' : `Failed (${res.status})`);
@@ -146,12 +134,6 @@ export default function OperationsPage() {
           </button>
         </div>
       </div>
-
-      {noToken ? (
-        <p className="text-muted mb-4" style={{ fontSize: 13 }}>
-          <a href="/login">Sign in</a> to load live checks.
-        </p>
-      ) : null}
 
       {notifHint ? (
         <p className="text-muted mb-2" style={{ fontSize: 12 }}>
@@ -278,7 +260,7 @@ export default function OperationsPage() {
                 </tbody>
               </table>
             </div>
-          ) : !noToken && !loading ? (
+          ) : !loading ? (
             <p className="text-muted mb-4" style={{ fontSize: 12 }}>
               No history rows yet — refresh a few times (every ~3 minutes new snapshot is stored).
             </p>

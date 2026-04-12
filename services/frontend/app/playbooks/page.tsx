@@ -50,8 +50,7 @@ export default function PlaybooksPage() {
     actions: [{ type: 'firewall_block', params: { target_field: 'value' } }],
   });
 
-  const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-  const authHdr = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
+  const postJson: RequestInit = { credentials: 'include', headers: { 'content-type': 'application/json' } };
 
   const notify = (msg: string) => {
     setToast(msg);
@@ -60,11 +59,9 @@ export default function PlaybooksPage() {
   };
 
   const load = async () => {
-    const t = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-    const h = t ? { authorization: `Bearer ${t}` } : {};
     const [pbRes, runsRes] = await Promise.all([
-      fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks`, { cache: 'no-store', headers: h }),
-      fetch(`${CLIENT_API_PREFIX}/automation/automation/runs?limit=50`, { cache: 'no-store', headers: h }),
+      fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks`, { cache: 'no-store', credentials: 'include' }),
+      fetch(`${CLIENT_API_PREFIX}/automation/automation/runs?limit=50`, { cache: 'no-store', credentials: 'include' }),
     ]);
     if (pbRes.ok) setPlaybooks(await pbRes.json());
     if (runsRes.ok) setRuns(await runsRes.json());
@@ -74,7 +71,8 @@ export default function PlaybooksPage() {
 
   const toggle = async (pb: Playbook) => {
     const res = await fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks/${pb.id}/toggle`, {
-      method: 'PUT', headers: authHdr,
+      method: 'PUT',
+      ...postJson,
       body: JSON.stringify({ enabled: !pb.enabled }),
     });
     if (res.ok) { notify(`${pb.name} ${!pb.enabled ? 'enabled' : 'disabled'}`); load(); }
@@ -82,14 +80,18 @@ export default function PlaybooksPage() {
   };
 
   const deletePlaybook = async (id: string) => {
-    const res = await fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks/${id}`, { method: 'DELETE', headers: authHdr });
+    const res = await fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks/${id}`, {
+      method: 'DELETE',
+      credentials: 'include',
+    });
     if (res.ok) { notify('Playbook deleted'); load(); }
     else notify('Cannot delete built-in playbook');
   };
 
   const runManual = async (id: string) => {
     const res = await fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks/${id}/run`, {
-      method: 'POST', headers: authHdr,
+      method: 'POST',
+      ...postJson,
       body: JSON.stringify({ ioc_type: 'ip', value: '1.2.3.4', risk: { final_score: 90 } }),
     });
     const data = await res.json();
@@ -100,7 +102,8 @@ export default function PlaybooksPage() {
   const createPlaybook = async () => {
     if (!form.name) { notify('Name required'); return; }
     const res = await fetch(`${CLIENT_API_PREFIX}/automation/automation/playbooks`, {
-      method: 'POST', headers: authHdr,
+      method: 'POST',
+      ...postJson,
       body: JSON.stringify(form),
     });
     const data = await res.json();

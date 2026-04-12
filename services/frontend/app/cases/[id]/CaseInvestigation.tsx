@@ -8,16 +8,6 @@ type RelatedCase = { id: string; title?: string; score?: number; reasons?: strin
 type RelatedAlert = { id: string; title?: string; overlap?: number; created_at?: string; source?: string };
 type TlEvent = { at?: string; kind?: string; label?: string; detail?: Record<string, unknown> };
 
-function jwtUser(token: string): string {
-  try {
-    const p = token.split('.')[1];
-    const o = JSON.parse(atob(p.replace(/-/g, '+').replace(/_/g, '/'))) as { preferred_username?: string; sub?: string };
-    return o.preferred_username || o.sub || 'user';
-  } catch {
-    return 'user';
-  }
-}
-
 export default function CaseInvestigation({
   caseId,
   alertId,
@@ -27,21 +17,30 @@ export default function CaseInvestigation({
   alertId?: string | null;
   onRefreshCase: () => void;
 }) {
-  const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-  const auth = token ? { authorization: `Bearer ${token}` } : {};
-
+  const [actor, setActor] = useState('user');
   const [relatedCases, setRelatedCases] = useState<RelatedCase[]>([]);
   const [relatedAlerts, setRelatedAlerts] = useState<RelatedAlert[]>([]);
   const [timeline, setTimeline] = useState<TlEvent[]>([]);
   const [err, setErr] = useState('');
   const [linking, setLinking] = useState<string | null>(null);
 
+  useEffect(() => {
+    void fetch(`${CLIENT_API_PREFIX}/auth/me`, { credentials: 'include' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { preferred_username?: string; sub?: string } | null) =>
+        setActor((d?.preferred_username || d?.sub || 'user') as string),
+      )
+      .catch(() => {});
+  }, []);
+
   const load = useCallback(async () => {
     setErr('');
     try {
       const [rc, tl] = await Promise.all([
-        fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/related?window_days=14&limit=20`, { headers: auth }),
-        fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/investigation-timeline`, { headers: auth }),
+        fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/related?window_days=14&limit=20`, {
+          credentials: 'include',
+        }),
+        fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/investigation-timeline`, { credentials: 'include' }),
       ]);
       if (!rc.ok) {
         setErr(`Related: ${rc.status}`);
@@ -54,7 +53,9 @@ export default function CaseInvestigation({
         setTimeline(tj.events || []);
       }
       if (alertId) {
-        const ra = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${alertId}/related?limit=20`, { headers: auth });
+        const ra = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${alertId}/related?limit=20`, {
+          credentials: 'include',
+        });
         if (ra.ok) {
           const aj = (await ra.json()) as { alerts?: RelatedAlert[] };
           setRelatedAlerts(aj.alerts || []);
@@ -67,20 +68,20 @@ export default function CaseInvestigation({
     } catch {
       setErr('Failed to load investigation data');
     }
-  }, [caseId, alertId, auth.authorization]);
+  }, [caseId, alertId]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   const linkTo = async (targetId: string) => {
-    if (!token) return;
     setLinking(targetId);
     try {
       const res = await fetch(`${CLIENT_API_PREFIX}/cases/cases/${caseId}/link`, {
         method: 'POST',
-        headers: { ...auth, 'content-type': 'application/json' },
-        body: JSON.stringify({ target_case_id: targetId, actor: jwtUser(token) }),
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ target_case_id: targetId, actor }),
       });
       if (!res.ok) {
         const d = (await res.json().catch(() => ({}))) as { detail?: string };
@@ -120,7 +121,7 @@ export default function CaseInvestigation({
                     type="button"
                     className="btn-primary"
                     style={{ fontSize: 11, padding: '4px 8px' }}
-                    disabled={!token || linking === r.id}
+                    disabled={linking === r.id}
                     onClick={() => void linkTo(r.id)}
                   >
                     {linking === r.id ? '…' : 'Link'}

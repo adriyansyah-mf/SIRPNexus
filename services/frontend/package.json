@@ -3,11 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "NODE_ENV=development node server.js",
     "build": "next build",
-    "start": "next start -p 3000"
+    "start": "NODE_ENV=production node server.js"
   },
   "dependencies": {
+    "http-proxy": "^1.18.1",
     "jose": "5.9.6",
     "next": "14.2.10",
     "react": "18.3.1",

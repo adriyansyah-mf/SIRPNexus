@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { resolveBearer } from '../../../../lib/adminAuth';
 
 const gateway = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
 export async function GET(req: NextRequest) {
-  const auth = req.headers.get('authorization') || '';
+  const auth = resolveBearer(req);
   if (!auth) return NextResponse.json({ detail: 'Missing authorization' }, { status: 401 });
 
   const resp = await fetch(`${gateway}/secrets/secrets`, {
@@ -15,7 +16,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function PUT(req: NextRequest) {
-  const auth = req.headers.get('authorization') || '';
+  const auth = resolveBearer(req);
   if (!auth) return NextResponse.json({ detail: 'Missing authorization' }, { status: 401 });
 
   const body = await req.json();

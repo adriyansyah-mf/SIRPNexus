@@ -31,16 +31,10 @@ export default function NotificationsOpsPage() {
   const [err, setErr] = useState('');
 
   const loadStatus = useCallback(async () => {
-    const token = typeof window !== 'undefined' ? (localStorage.getItem('sirp_token') || '') : '';
-    if (!token) {
-      setStatus(null);
-      setErr('');
-      return;
-    }
     setErr('');
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/notification-delivery-status`, {
       cache: 'no-store',
-      headers: { authorization: `Bearer ${token}` },
+      credentials: 'include',
     });
     if (!res.ok) {
       setStatus(null);
@@ -55,18 +49,13 @@ export default function NotificationsOpsPage() {
   }, [loadStatus]);
 
   const sendTest = async () => {
-    const token = localStorage.getItem('sirp_token') || '';
-    if (!token) {
-      setToastOk(false);
-      setToast('Sign in first');
-      return;
-    }
     setBusy(true);
     setToast('');
     try {
       const res = await fetch(`${CLIENT_API_PREFIX}/notifications/notifications/test`, {
         method: 'POST',
-        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ message: msg }),
       });
       const data = await res.json().catch(() => ({}));
@@ -85,8 +74,6 @@ export default function NotificationsOpsPage() {
     }
   };
 
-  const tokenMissing = typeof window !== 'undefined' && !localStorage.getItem('sirp_token');
-
   return (
     <div>
       <div className="page-hd">
@@ -101,12 +88,6 @@ export default function NotificationsOpsPage() {
         </button>
       </div>
 
-      {tokenMissing ? (
-        <p className="text-muted mb-4" style={{ fontSize: 13 }}>
-          <Link href="/login">Sign in</Link> to view channel configuration and send tests.
-        </p>
-      ) : null}
-
       {err ? (
         <div className="card mb-3" style={{ padding: 12, borderColor: 'var(--sev-high)' }}>
           {err}
@@ -119,7 +100,7 @@ export default function NotificationsOpsPage() {
           Shows whether required secret <strong>keys</strong> exist in secret-service (not values). Set them under{' '}
           <Link href="/admin">Admin</Link>.
         </p>
-        {!status && !err && !tokenMissing ? <div className="empty-state">Loading…</div> : null}
+        {!status && !err ? <div className="empty-state">Loading…</div> : null}
         {status ? (
           <table className="data-table">
             <thead>
@@ -164,9 +145,9 @@ export default function NotificationsOpsPage() {
           className="w-full mb-3"
           value={msg}
           onChange={(e) => setMsg(e.target.value)}
-          disabled={busy || tokenMissing}
+          disabled={busy}
         />
-        <button type="button" className="btn-primary" disabled={busy || tokenMissing} onClick={() => void sendTest()}>
+        <button type="button" className="btn-primary" disabled={busy} onClick={() => void sendTest()}>
           {busy ? 'Sending…' : 'Send test notification'}
         </button>
       </div>

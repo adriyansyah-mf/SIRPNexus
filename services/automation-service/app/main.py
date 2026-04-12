@@ -25,7 +25,16 @@ logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="Automation Service")
 Instrumentator().instrument(app).expose(app)
 
-INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+ALLOW_INSECURE_NO_INTERNAL_TOKEN = os.getenv("ALLOW_INSECURE_NO_INTERNAL_TOKEN", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+if not INTERNAL_SERVICE_TOKEN and not ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+    raise RuntimeError(
+        "INTERNAL_SERVICE_TOKEN is required. Set ALLOW_INSECURE_NO_INTERNAL_TOKEN=1 for local dev only."
+    )
 SECRET_SERVICE_URL = os.getenv("SECRET_SERVICE_URL", "http://secret-service:8001")
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 POSTGRES_DSN = dict(
@@ -273,7 +282,11 @@ async def shutdown():
 async def enforce_internal_token(request: Request, call_next):
     if request.url.path in {"/health", "/metrics"}:
         return await call_next(request)
-    if INTERNAL_SERVICE_TOKEN and request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
+    if not INTERNAL_SERVICE_TOKEN.strip():
+        if ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+            return await call_next(request)
+        return JSONResponse(status_code=503, content={"detail": "INTERNAL_SERVICE_TOKEN is not configured"})
+    if request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
         return JSONResponse(status_code=401, content={"detail": "Invalid internal service token"})
     return await call_next(request)
 

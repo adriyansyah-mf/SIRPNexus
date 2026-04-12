@@ -73,7 +73,6 @@ function GraphCanvas({ nodes, edges }: { nodes: GraphNode[]; edges: GraphEdge[] 
 
 export default function IrCenterPage() {
   const [tab, setTab] = useState<Tab>('graph');
-  const [token, setToken] = useState('');
   const [graphCaseId, setGraphCaseId] = useState('');
   const [graphAlertId, setGraphAlertId] = useState('');
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; edges: GraphEdge[] } | null>(null);
@@ -119,10 +118,6 @@ export default function IrCenterPage() {
   const [err, setErr] = useState('');
 
   useEffect(() => {
-    setToken(typeof window !== 'undefined' ? localStorage.getItem('sirp_token') || '' : '');
-  }, []);
-
-  useEffect(() => {
     if (typeof window === 'undefined') return;
     const c = new URLSearchParams(window.location.search).get('case');
     if (c) {
@@ -131,11 +126,10 @@ export default function IrCenterPage() {
     }
   }, []);
 
-  const authHdr = useMemo(() => {
-    const h: Record<string, string> = { 'content-type': 'application/json' };
-    if (token) h.authorization = `Bearer ${token}`;
-    return h;
-  }, [token]);
+  const postJson = useMemo(
+    (): RequestInit => ({ credentials: 'include', headers: { 'content-type': 'application/json' } }),
+    [],
+  );
 
   const loadGraph = useCallback(async () => {
     setErr('');
@@ -149,7 +143,7 @@ export default function IrCenterPage() {
     }
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/investigation-graph?${qs}`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setGraphData(null);
@@ -159,7 +153,7 @@ export default function IrCenterPage() {
     const d = (await res.json()) as { nodes?: GraphNode[]; edges?: GraphEdge[] };
     setGraphData({ nodes: d.nodes || [], edges: d.edges || [] });
     setMsg('Graph loaded');
-  }, [graphCaseId, graphAlertId, token]);
+  }, [graphCaseId, graphAlertId]);
 
   const loadIndexedGraph = async () => {
     setErr('');
@@ -173,7 +167,7 @@ export default function IrCenterPage() {
     const qs = new URLSearchParams({ focus_kind: fk, focus_id: fid, limit: '300' });
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/graph/neighbors?${qs}`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setErr(`Indexed graph failed (${res.status}) — run Reindex as admin first`);
@@ -188,7 +182,7 @@ export default function IrCenterPage() {
     setErr('');
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/graph/reindex`, {
       method: 'POST',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -202,7 +196,7 @@ export default function IrCenterPage() {
     setErr('');
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/mentions/for-me?limit=60`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setErr(`Mentions failed (${res.status})`);
@@ -222,7 +216,7 @@ export default function IrCenterPage() {
     if (siemIdx.trim()) qs.set('index', siemIdx.trim());
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/retro-hunt/siem?${qs}`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     const j = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -241,7 +235,7 @@ export default function IrCenterPage() {
     }
     const res = await fetch(
       `${CLIENT_API_PREFIX}/soc/investigation-bundle?case_id=${encodeURIComponent(bundleCaseId.trim())}`,
-      { cache: 'no-store', headers: token ? { authorization: `Bearer ${token}` } : {} },
+      { cache: 'no-store', credentials: 'include' },
     );
     if (!res.ok) {
       setErr(`Bundle failed (${res.status})`);
@@ -269,7 +263,7 @@ export default function IrCenterPage() {
     const alert_ids = shiftAlerts.split(/[\s,]+/).filter(Boolean);
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/shift-report`, {
       method: 'POST',
-      headers: authHdr,
+      ...postJson,
       body: JSON.stringify({ summary: shiftSummary, case_ids, alert_ids }),
     });
     if (!res.ok) {
@@ -282,7 +276,7 @@ export default function IrCenterPage() {
     setMsg('Shift report saved');
     const lr = await fetch(`${CLIENT_API_PREFIX}/soc/shift-reports?limit=20`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (lr.ok) {
       const j = (await lr.json()) as { items?: typeof shifts };
@@ -295,7 +289,7 @@ export default function IrCenterPage() {
     const qs = custodyCase.trim() ? `?case_id=${encodeURIComponent(custodyCase.trim())}&limit=80` : '?limit=80';
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/custody-log${qs}`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setErr(`Custody list failed (${res.status})`);
@@ -309,7 +303,7 @@ export default function IrCenterPage() {
     setErr('');
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/analytics-advanced`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setErr(`Analytics failed (${res.status})`);
@@ -326,7 +320,7 @@ export default function IrCenterPage() {
     }
     const res = await fetch(
       `${CLIENT_API_PREFIX}/soc/retro-hunt?q=${encodeURIComponent(retroQ.trim())}&limit=50`,
-      { cache: 'no-store', headers: token ? { authorization: `Bearer ${token}` } : {} },
+      { cache: 'no-store', credentials: 'include' },
     );
     if (!res.ok) {
       setErr(`Retro-hunt failed (${res.status})`);
@@ -340,7 +334,7 @@ export default function IrCenterPage() {
   const loadWatch = async () => {
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/watchlist`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (res.ok) {
       const j = (await res.json()) as { items?: typeof watchItems };
@@ -352,7 +346,7 @@ export default function IrCenterPage() {
     if (!watchAdd.trim()) return;
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/watchlist`, {
       method: 'POST',
-      headers: authHdr,
+      ...postJson,
       body: JSON.stringify({ case_id: watchAdd.trim() }),
     });
     if (res.ok) {
@@ -365,7 +359,7 @@ export default function IrCenterPage() {
   const removeWatch = async (cid: string) => {
     await fetch(`${CLIENT_API_PREFIX}/soc/watchlist/${encodeURIComponent(cid)}`, {
       method: 'DELETE',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     void loadWatch();
   };
@@ -373,7 +367,7 @@ export default function IrCenterPage() {
   const loadApprovals = async () => {
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/playbook-run-requests?status=pending&limit=50`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (res.ok) {
       const j = (await res.json()) as { items?: typeof pbRequests };
@@ -395,7 +389,7 @@ export default function IrCenterPage() {
     }
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/playbook-run-requests`, {
       method: 'POST',
-      headers: authHdr,
+      ...postJson,
       body: JSON.stringify({
         playbook_id: pbId.trim(),
         case_id: pbCase.trim() || undefined,
@@ -412,7 +406,7 @@ export default function IrCenterPage() {
   const approvePb = async (id: string) => {
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/playbook-run-requests/${id}/approve`, {
       method: 'POST',
-      headers: authHdr,
+      ...postJson,
       body: JSON.stringify({}),
     });
     const data = (await res.json().catch(() => ({}))) as {
@@ -433,7 +427,7 @@ export default function IrCenterPage() {
   const rejectPb = async (id: string) => {
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/playbook-run-requests/${id}/reject`, {
       method: 'POST',
-      headers: authHdr,
+      ...postJson,
       body: JSON.stringify({ note: 'rejected from IR center' }),
     });
     if (res.ok) setMsg('Rejected');
@@ -445,7 +439,7 @@ export default function IrCenterPage() {
     if (!enrichAlert.trim()) return;
     const res = await fetch(
       `${CLIENT_API_PREFIX}/soc/enrichment-hints?alert_id=${encodeURIComponent(enrichAlert.trim())}`,
-      { cache: 'no-store', headers: token ? { authorization: `Bearer ${token}` } : {} },
+      { cache: 'no-store', credentials: 'include' },
     );
     if (res.ok) {
       const j = (await res.json()) as { hints?: unknown[] };
@@ -454,21 +448,20 @@ export default function IrCenterPage() {
   };
 
   useEffect(() => {
-    if (!token) return;
     void fetch(`${CLIENT_API_PREFIX}/soc/shift-reports?limit=15`, {
       cache: 'no-store',
-      headers: { authorization: `Bearer ${token}` },
+      credentials: 'include',
     })
       .then((r) => r.json())
       .then((j: { items?: typeof shifts }) => setShifts(j.items || []))
       .catch(() => {});
-  }, [token]);
+  }, []);
 
   useEffect(() => {
-    if (tab === 'watch' && token) void loadWatch();
-    if (tab === 'approvals' && token) void loadApprovals();
-    if (tab === 'mentions' && token) void loadMyMentions();
-  }, [tab, token]);
+    if (tab === 'watch') void loadWatch();
+    if (tab === 'approvals') void loadApprovals();
+    if (tab === 'mentions') void loadMyMentions();
+  }, [tab]);
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'graph', label: 'Investigation graph' },
@@ -494,12 +487,6 @@ export default function IrCenterPage() {
           </div>
         </div>
       </div>
-
-      {!token ? (
-        <p className="text-muted mb-4" style={{ fontSize: 13 }}>
-          <Link href="/login">Sign in</Link> to use the IR center.
-        </p>
-      ) : null}
 
       {err ? (
         <div className="card mb-3" style={{ padding: 10, borderColor: 'var(--sev-high)' }}>

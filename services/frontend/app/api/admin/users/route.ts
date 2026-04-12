@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { resolveBearer } from '../../../../lib/adminAuth';
 
 const GW = process.env.API_GATEWAY_URL || 'http://api-gateway:8000';
 
 async function fwd(req: NextRequest, method: string, body?: unknown) {
-  const auth = req.headers.get('authorization') || '';
+  const auth = resolveBearer(req);
   if (!auth) return NextResponse.json({ detail: 'Missing authorization' }, { status: 401 });
 
   const resp = await fetch(`${GW}/auth/users`, {

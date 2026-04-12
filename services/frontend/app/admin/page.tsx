@@ -63,7 +63,6 @@ function relTime(ts?: string): string {
 
 /* ── Component ──────────────────────────────────────────────────────────────── */
 export default function AdminPage() {
-  const [token, setToken] = useState('');
   const [tab, setTab] = useState<Tab>('rbac');
 
   // Secrets state
@@ -87,11 +86,11 @@ export default function AdminPage() {
     toastRef.current = setTimeout(() => setToast(null), 3500);
   };
 
-  const authHdr = (t?: string) => ({ authorization: `Bearer ${t || token}` });
+  const jsonPost: RequestInit = { credentials: 'include', headers: { 'content-type': 'application/json' } };
 
   /* ── Secrets ────────────────────────────────────────────────────────────── */
-  const loadSecrets = async (t: string) => {
-    const res = await fetch('/api/admin/secrets', { headers: authHdr(t), cache: 'no-store' });
+  const loadSecrets = async () => {
+    const res = await fetch('/api/admin/secrets', { credentials: 'include', cache: 'no-store' });
     const data = await res.json();
     if (Array.isArray(data)) setConfigured(new Set(data.map((d: { key: string }) => d.key)));
     else notify(data.detail || 'Failed to load secrets', false);
@@ -102,7 +101,7 @@ export default function AdminPage() {
     if (!value) { notify('Enter a value first', false); return; }
     const res = await fetch('/api/admin/secrets', {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', ...authHdr() },
+      ...jsonPost,
       body: JSON.stringify({ key, value }),
     });
     const data = await res.json();
@@ -116,8 +115,8 @@ export default function AdminPage() {
   };
 
   /* ── Users/RBAC ─────────────────────────────────────────────────────────── */
-  const loadUsers = async (t?: string) => {
-    const res = await fetch('/api/admin/users', { headers: authHdr(t), cache: 'no-store' });
+  const loadUsers = async () => {
+    const res = await fetch('/api/admin/users', { credentials: 'include', cache: 'no-store' });
     const data = await res.json();
     if (Array.isArray(data)) setUsers(data);
     else notify(data.detail || 'Failed to load users', false);
@@ -128,7 +127,7 @@ export default function AdminPage() {
     if (!username.trim() || !password.trim()) { notify('Username and password required', false); return; }
     const res = await fetch('/api/admin/users', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', ...authHdr() },
+      ...jsonPost,
       body: JSON.stringify({ username: username.trim(), password, role }),
     });
     const data = await res.json();
@@ -146,7 +145,7 @@ export default function AdminPage() {
     if (!editRoleUser) return;
     const res = await fetch(`/api/admin/users/${encodeURIComponent(editRoleUser.username)}`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', ...authHdr() },
+      ...jsonPost,
       body: JSON.stringify({ role: modalInput }),
     });
     const data = await res.json();
@@ -164,7 +163,7 @@ export default function AdminPage() {
     if (!resetPwUser) return;
     const res = await fetch(`/api/admin/users/${encodeURIComponent(resetPwUser.username)}`, {
       method: 'PUT',
-      headers: { 'content-type': 'application/json', ...authHdr() },
+      ...jsonPost,
       body: JSON.stringify({ password: modalInput }),
     });
     const data = await res.json();
@@ -180,7 +179,7 @@ export default function AdminPage() {
   const deleteUser = async (username: string) => {
     const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}`, {
       method: 'DELETE',
-      headers: authHdr(),
+      credentials: 'include',
     });
     const data = await res.json();
     if (res.ok) {
@@ -193,25 +192,9 @@ export default function AdminPage() {
 
   /* ── Bootstrap ──────────────────────────────────────────────────────────── */
   useEffect(() => {
-    const t = localStorage.getItem('sirp_token') || '';
-    setToken(t);
-    if (t) {
-      loadSecrets(t);
-      loadUsers(t);
-    }
+    void loadSecrets();
+    void loadUsers();
   }, []);
-
-  if (!token) {
-    return (
-      <div>
-        <div className="page-hd"><h1>Admin</h1></div>
-        <div className="card" style={{ maxWidth: 400 }}>
-          <p className="text-muted">You must be logged in as an admin to access this panel.</p>
-          <a href="/login" className="btn btn-primary">Go to login</a>
-        </div>
-      </div>
-    );
-  }
 
   /* ── Tab nav ─────────────────────────────────────────────────────────────── */
   const tabStyle = (t: Tab): React.CSSProperties => ({
@@ -231,7 +214,7 @@ export default function AdminPage() {
       <div className="page-hd">
         <h1>Admin</h1>
         <div className="flex gap-2">
-          <button onClick={() => { loadUsers(); loadSecrets(token); }}>↻ Refresh</button>
+          <button type="button" onClick={() => { void loadUsers(); void loadSecrets(); }}>↻ Refresh</button>
         </div>
       </div>
 

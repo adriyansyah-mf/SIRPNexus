@@ -34,14 +34,51 @@ if not APP_AUTH_JWT_SECRET:
     logger.critical("APP_AUTH_JWT_SECRET is not set — refusing to start")
     sys.exit(1)
 
+ALLOW_INSECURE_NO_INTERNAL_TOKEN = os.getenv("ALLOW_INSECURE_NO_INTERNAL_TOKEN", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+INBOUND_WEBHOOK_TOKEN = os.getenv("INBOUND_WEBHOOK_TOKEN", "").strip()
+ALLOW_INGEST_WITHOUT_TOKEN = os.getenv("ALLOW_INGEST_WITHOUT_TOKEN", "").strip().lower() in ("1", "true", "yes")
+
+if not INTERNAL_SERVICE_TOKEN and not ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+    logger.critical(
+        "INTERNAL_SERVICE_TOKEN is not set — refusing to start (set ALLOW_INSECURE_NO_INTERNAL_TOKEN=1 for dev only)"
+    )
+    sys.exit(1)
+
 AUDIENCE = os.getenv("KEYCLOAK_AUDIENCE", "sirp-api")
 OIDC_ISSUER = os.getenv("KEYCLOAK_ISSUER", "")
-INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
-INBOUND_WEBHOOK_TOKEN = os.getenv("INBOUND_WEBHOOK_TOKEN", "")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(4 * 1024 * 1024)))  # 4 MB default
 # Multipart case evidence uploads (POST …/cases/cases/{id}/evidence)
 MAX_CASE_EVIDENCE_BYTES = int(os.getenv("MAX_CASE_EVIDENCE_BYTES", str(32 * 1024 * 1024)))
+
+# Strip client-supplied spoofing / privilege headers before proxying to internal services.
+_STRIP_FROM_CLIENT = frozenset(
+    {
+        "x-internal-token",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+        "forwarded",
+        "x-sirp-ingest-client-ip",
+    }
+)
+
+
+def _forward_headers_from_request(request: Request) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for k, v in request.headers.items():
+        lk = k.lower()
+        if lk == "host" or lk in _STRIP_FROM_CLIENT:
+            continue
+        out[k] = v
+    return out
+
 
 # ── Service map ───────────────────────────────────────────────────────────────
 def _env_url(name: str, default: str) -> str:
@@ -507,6 +544,18 @@ async def auth_login(request: Request):
     return {"access_token": token, "token_type": "Bearer", "expires_in": 28800, "role": row["role"]}
 
 
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    """JWT claims for the current session (Bearer or forwarded from BFF cookie)."""
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    claims = _decode_token(auth.split(" ", 1)[1])
+    roles = list(claims.get("realm_access", {}).get("roles", []) or [])
+    user = str(claims.get("preferred_username") or claims.get("sub") or "").strip() or "user"
+    return {"sub": claims.get("sub"), "preferred_username": user, "roles": roles}
+
+
 # ── Auth: user management (admin only) ───────────────────────────────────────
 @app.get("/auth/users")
 async def list_users(request: Request):
@@ -919,7 +968,11 @@ def _upstream_headers() -> dict[str, str]:
 
 
 def _require_internal_token(request: Request) -> None:
-    if not INTERNAL_SERVICE_TOKEN or request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
+    if not INTERNAL_SERVICE_TOKEN.strip():
+        if ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+            return
+        raise HTTPException(status_code=503, detail="INTERNAL_SERVICE_TOKEN is not configured")
+    if request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
         raise HTTPException(status_code=401, detail="Internal service authentication required")
 
 
@@ -2069,7 +2122,7 @@ async def soc_enrichment_hints(request: Request, alert_id: str):
     return {"alert_id": aid, "hints": hints[:40]}
 
 
-# ── Inbound SIEM ingest (no gateway rate limit; token + alert-service allowlist) ─
+# ── Inbound SIEM ingest (rate limited; token required unless explicit dev bypass) ─
 def _validate_webhook_token(request: Request) -> None:
     provided = request.headers.get("x-webhook-token", "")
     auth = request.headers.get("authorization", "")
@@ -2077,11 +2130,17 @@ def _validate_webhook_token(request: Request) -> None:
     if INBOUND_WEBHOOK_TOKEN:
         if provided != INBOUND_WEBHOOK_TOKEN and bearer != INBOUND_WEBHOOK_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid webhook token")
-    # If INBOUND_WEBHOOK_TOKEN not set, fall back to allowlist enforced by alert-service
+        return
+    if ALLOW_INGEST_WITHOUT_TOKEN:
+        return
+    raise HTTPException(
+        status_code=503,
+        detail="INBOUND_WEBHOOK_TOKEN must be set for ingest (or set ALLOW_INGEST_WITHOUT_TOKEN=1 for dev only)",
+    )
 
 
 @app.post("/ingest/{source}")
-@limiter.exempt
+@limiter.limit("120/minute")
 async def ingest_external(source: str, request: Request):
     if source not in {"wazuh", "splunk", "generic"}:
         raise HTTPException(status_code=400, detail="Unsupported ingest source")
@@ -2090,11 +2149,10 @@ async def ingest_external(source: str, request: Request):
     target = SERVICE_MAP["alerts"]
     url = urljoin(f"{target.rstrip('/')}/", f"alerts/webhook/{source}")
     body = await request.body()
-    forward_headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower()
-        not in {"host", "authorization", "x-webhook-token", "x-sirp-ingest-client-ip"}
-    }
+    forward_headers = _forward_headers_from_request(request)
+    for hk in list(forward_headers.keys()):
+        if hk.lower() in ("authorization", "x-webhook-token"):
+            del forward_headers[hk]
     # Alert-service allowlist sees the gateway container IP unless we forward the real client (Wazuh).
     client_host = request.client.host if request.client else ""
     if client_host:
@@ -2115,11 +2173,13 @@ async def ingest_external(source: str, request: Request):
 # ── WebSocket stream (auth required) ─────────────────────────────────────────
 @app.websocket("/stream/events")
 async def stream_events(websocket: WebSocket):
-    # Validate token before accepting
+    # Validate token before accepting (query param deprecated — prefer Cookie: sirp_token via same-origin WS proxy)
     token = websocket.query_params.get("token") or ""
     if not token:
         auth_header = websocket.headers.get("authorization", "")
         token = auth_header.split(" ", 1)[1] if auth_header.startswith("Bearer ") else ""
+    if not token:
+        token = (websocket.cookies or {}).get("sirp_token") or ""
     if not token:
         await websocket.close(code=4001, reason="Authorization required")
         return
@@ -2190,7 +2250,7 @@ async def proxy(service: str, path: str, request: Request):
 
     body = await request.body()
     url = urljoin(f"{target.rstrip('/')}/", path)
-    forward_headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    forward_headers = _forward_headers_from_request(request)
     if INTERNAL_SERVICE_TOKEN:
         forward_headers["x-internal-token"] = INTERNAL_SERVICE_TOKEN
     async with httpx.AsyncClient(timeout=60) as client:

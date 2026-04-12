@@ -26,7 +26,6 @@ export default function HuntingPage() {
   const [label, setLabel] = useState('');
   const [q, setQ] = useState('');
   const [mounted, setMounted] = useState(false);
-  const [token, setToken] = useState('');
   const [msg, setMsg] = useState('');
 
   const persistLocal = useCallback((list: LocalQuery[]) => {
@@ -34,14 +33,10 @@ export default function HuntingPage() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
   }, []);
 
-  const loadServer = useCallback(async (t: string) => {
-    if (!t) {
-      setServerSaved([]);
-      return;
-    }
+  const loadServer = useCallback(async () => {
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/hunting/queries`, {
       cache: 'no-store',
-      headers: { authorization: `Bearer ${t}` },
+      credentials: 'include',
     });
     if (!res.ok) {
       setServerSaved([]);
@@ -54,9 +49,7 @@ export default function HuntingPage() {
   useEffect(() => {
     setMounted(true);
     setLocalSaved(loadLocal());
-    const t = localStorage.getItem('sirp_token') || '';
-    setToken(t);
-    void loadServer(t);
+    void loadServer();
   }, [loadServer]);
 
   const saveLocal = () => {
@@ -75,12 +68,12 @@ export default function HuntingPage() {
 
   const saveServer = async () => {
     const trimmed = q.trim();
-    if (trimmed.length < 2 || !token) return;
+    if (trimmed.length < 2) return;
     setMsg('');
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/hunting/queries`, {
       method: 'POST',
+      credentials: 'include',
       headers: {
-        authorization: `Bearer ${token}`,
         'content-type': 'application/json',
       },
       body: JSON.stringify({ label: label.trim() || trimmed.slice(0, 80), query: trimmed }),
@@ -92,7 +85,7 @@ export default function HuntingPage() {
     }
     setLabel('');
     setMsg('Saved to server (per user).');
-    void loadServer(token);
+    void loadServer();
   };
 
   const removeLocal = (id: string) => {
@@ -100,12 +93,11 @@ export default function HuntingPage() {
   };
 
   const removeServer = async (id: string) => {
-    if (!token) return;
     const res = await fetch(`${CLIENT_API_PREFIX}/soc/hunting/queries/${encodeURIComponent(id)}`, {
       method: 'DELETE',
-      headers: { authorization: `Bearer ${token}` },
+      credentials: 'include',
     });
-    if (res.ok) void loadServer(token);
+    if (res.ok) void loadServer();
     else setMsg('Could not delete server hunt');
   };
 
@@ -146,19 +138,18 @@ export default function HuntingPage() {
             Run search
           </Link>
           <button type="button" onClick={saveLocal}>Save (browser)</button>
-          <button type="button" className="btn-primary" onClick={() => void saveServer()} disabled={!token || q.trim().length < 2}>
+          <button type="button" className="btn-primary" onClick={() => void saveServer()} disabled={q.trim().length < 2}>
             Save (server)
           </button>
         </div>
-        {!token ? (
-          <p className="text-muted mt-2" style={{ fontSize: 12 }}>Sign in to save hunts to the platform database (shared per username).</p>
-        ) : null}
+        <p className="text-muted mt-2" style={{ fontSize: 12 }}>
+          Server hunts are stored per username in the platform database.
+        </p>
       </div>
 
       <div className="card mb-4" style={{ padding: 16 }}>
         <div className="card-title mb-2">Saved on server ({serverSaved.length})</div>
-        {!token ? <div className="empty-state">Sign in to see server hunts.</div> : null}
-        {token && !serverSaved.length ? <div className="empty-state">No server hunts yet.</div> : null}
+        {!serverSaved.length ? <div className="empty-state">No server hunts yet.</div> : null}
         <ul className="search-hit-list">
           {serverSaved.map((s) => (
             <li key={s.id} style={{ display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center' }}>

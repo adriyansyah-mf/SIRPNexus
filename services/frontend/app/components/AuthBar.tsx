@@ -1,30 +1,21 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { usePathname } from 'next/navigation';
 
 export default function AuthBar() {
-  const [hasToken, setHasToken] = useState(false);
+  const pathname = usePathname();
 
-  useEffect(() => {
-    setHasToken(Boolean(localStorage.getItem('sirp_token')));
-  }, []);
+  if (pathname === '/login') {
+    return null;
+  }
 
-  const logout = () => {
-    localStorage.removeItem('sirp_token');
-    document.cookie = 'sirp_token=; path=/; max-age=0';
+  const logout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
     window.location.href = '/login';
   };
 
-  if (!hasToken) {
-    return (
-      <a href="/login" className="btn btn-primary" style={{ fontSize: 12, padding: '4px 12px' }}>
-        Login
-      </a>
-    );
-  }
-
   return (
-    <button onClick={logout} style={{ fontSize: 12, padding: '4px 12px' }}>
+    <button type="button" onClick={() => void logout()} style={{ fontSize: 12, padding: '4px 12px' }}>
       Logout
     </button>
   );

@@ -144,10 +144,7 @@ export default function AlertsPage() {
   };
 
   const load = async () => {
-    const token = localStorage.getItem('sirp_token') || '';
-    const headers: Record<string, string> = {};
-    if (token) headers.authorization = `Bearer ${token}`;
-    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts`, { cache: 'no-store', headers });
+    const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts`, { cache: 'no-store', credentials: 'include' });
     const data = await res.json().catch(() => []);
     setAlerts(Array.isArray(data) ? data : []);
   };
@@ -155,17 +152,12 @@ export default function AlertsPage() {
   useEffect(() => { load(); }, []);
 
   const clearAllAlerts = async () => {
-    const t = localStorage.getItem('sirp_token') || '';
-    if (!t) {
-      notify('Sign in to clear alerts');
-      return;
-    }
     const n = alerts.length;
     if (!window.confirm(`Hapus SEMUA alert (${n} saat ini di daftar)? Tindakan ini permanen.`)) return;
     if (!window.confirm('Konfirmasi sekali lagi: seluruh alert di database environment ini akan dihapus.')) return;
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts`, {
       method: 'DELETE',
-      headers: { authorization: `Bearer ${t}` },
+      credentials: 'include',
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -183,9 +175,8 @@ export default function AlertsPage() {
 
   const confirmModal = async () => {
     if (!modal) return;
-    const token = localStorage.getItem('sirp_token') || '';
     const headers: Record<string, string> = { 'content-type': 'application/json' };
-    if (token) headers['authorization'] = `Bearer ${token}`;
+    const withCreds = { headers, credentials: 'include' as RequestCredentials };
 
     if (modal.type === 'assign') {
       if (!modalInput.trim()) {
@@ -193,20 +184,23 @@ export default function AlertsPage() {
         return;
       }
       await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/assign`, {
-        method: 'POST', headers,
+        method: 'POST',
+        ...withCreds,
         body: JSON.stringify({ assigned_to: modalInput.trim(), assigned_by: 'ui-admin' }),
       });
       notify(`Assigned alert to ${modalInput.trim()}`);
     } else if (modal.type === 'tags') {
       const tags = modalInput.split(',').map((t) => t.trim()).filter(Boolean);
       await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/tags`, {
-        method: 'POST', headers,
+        method: 'POST',
+        ...withCreds,
         body: JSON.stringify({ tags }),
       });
       notify(`Tags updated`);
     } else if (modal.type === 'status') {
       await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${modal.id}/status`, {
-        method: 'POST', headers,
+        method: 'POST',
+        ...withCreds,
         body: JSON.stringify({ status: modalInput }),
       });
       notify(`Status set to ${modalInput}`);
@@ -219,7 +213,7 @@ export default function AlertsPage() {
       await runInChunks(modal.ids, 5, async (id) => {
         await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/assign`, {
           method: 'POST',
-          headers,
+          ...withCreds,
           body: JSON.stringify({ assigned_to: assignee, assigned_by: 'bulk-ui' }),
         });
       });
@@ -234,7 +228,7 @@ export default function AlertsPage() {
       await runInChunks(modal.ids, 5, async (id) => {
         await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/tags`, {
           method: 'POST',
-          headers,
+          ...withCreds,
           body: JSON.stringify({ tags }),
         });
       });
@@ -244,7 +238,7 @@ export default function AlertsPage() {
       await runInChunks(modal.ids, 5, async (id) => {
         await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/status`, {
           method: 'POST',
-          headers,
+          ...withCreds,
           body: JSON.stringify({ status: modalInput }),
         });
       });
@@ -256,7 +250,7 @@ export default function AlertsPage() {
       await runInChunks(modal.ids, 3, async (id) => {
         const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/escalate`, {
           method: 'POST',
-          headers: token ? { authorization: `Bearer ${token}` } : {},
+          credentials: 'include',
         });
         if (res.ok) ok += 1;
         else fail += 1;
@@ -269,10 +263,9 @@ export default function AlertsPage() {
   };
 
   const escalate = async (id: string) => {
-    const token = localStorage.getItem('sirp_token') || '';
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${id}/escalate`, {
       method: 'POST',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     const data = await res.json().catch(() => ({}));
     if (data.status === 'escalated' && data.case?.id) {

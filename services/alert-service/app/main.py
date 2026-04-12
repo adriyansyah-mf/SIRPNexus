@@ -36,9 +36,21 @@ _OPENCTI_LOGIN_JWT_TTL_SEC = 600.0
 ALERTS: list[dict[str, Any]] = []
 
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-ELASTIC_URL = os.getenv("ELASTICSEARCH_URL", "http://elasticsearch:9200")
-INGEST_ALLOWLIST = [v.strip() for v in os.getenv("INGEST_ALLOWLIST", "0.0.0.0/0").split(",")]
-INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+ELASTIC_URL = os.getenv("ELASTICSEARCH_URL", "http://elastic:sirp@elasticsearch:9200")
+_DEFAULT_INGEST_NETS = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
+INGEST_ALLOWLIST = [
+    v.strip() for v in os.getenv("INGEST_ALLOWLIST", _DEFAULT_INGEST_NETS).split(",") if v.strip()
+]
+ALLOW_INSECURE_NO_INTERNAL_TOKEN = os.getenv("ALLOW_INSECURE_NO_INTERNAL_TOKEN", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
+if not INTERNAL_SERVICE_TOKEN and not ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+    raise RuntimeError(
+        "INTERNAL_SERVICE_TOKEN is required. Set ALLOW_INSECURE_NO_INTERNAL_TOKEN=1 for local dev only."
+    )
 SECRET_SERVICE_URL = os.getenv("SECRET_SERVICE_URL", "http://secret-service:8001")
 ABUSEIPDB_API_BASE = os.getenv("ABUSEIPDB_API_BASE", "https://api.abuseipdb.com/api/v2").rstrip("/")
 
@@ -1027,7 +1039,11 @@ async def abuseipdb_lookup(body: dict[str, Any]):
 async def enforce_internal_token(request: Request, call_next):
     if request.url.path in {"/health", "/metrics"} or request.url.path.startswith("/alerts/webhook/"):
         return await call_next(request)
-    if INTERNAL_SERVICE_TOKEN and request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
+    if not INTERNAL_SERVICE_TOKEN.strip():
+        if ALLOW_INSECURE_NO_INTERNAL_TOKEN:
+            return await call_next(request)
+        return JSONResponse(status_code=503, content={"detail": "INTERNAL_SERVICE_TOKEN is not configured"})
+    if request.headers.get("x-internal-token") != INTERNAL_SERVICE_TOKEN:
         return JSONResponse(status_code=401, content={"detail": "Invalid internal service token"})
     return await call_next(request)
 

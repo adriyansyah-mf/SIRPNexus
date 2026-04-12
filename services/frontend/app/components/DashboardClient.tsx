@@ -63,12 +63,11 @@ function relTime(ts?: string): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-async function fetchJson<T>(path: string, token: string | null): Promise<T> {
-  if (!token) return [] as T;
+async function fetchJson<T>(path: string): Promise<T> {
   try {
     const res = await fetch(`${CLIENT_API_PREFIX}${path}`, {
       cache: 'no-store',
-      headers: { authorization: `Bearer ${token}` },
+      credentials: 'include',
     });
     if (!res.ok) return [] as T;
     return (await res.json()) as T;
@@ -82,44 +81,30 @@ export default function DashboardClient() {
   const [cases, setCases] = useState<CaseItem[]>([]);
   const [soc, setSoc] = useState<SocSummary | null>(null);
   const [ops, setOps] = useState<OpsHealth | null>(null);
-  const [loaded, setLoaded] = useState(false);
-
   const load = useCallback(async () => {
-    const token = typeof window !== 'undefined' ? localStorage.getItem('sirp_token') : null;
     const [a, c, s, o] = await Promise.all([
-      fetchJson<AlertItem[]>('/alerts/alerts', token),
-      fetchJson<CaseItem[]>('/cases/cases', token),
-      token
-        ? fetch(`${CLIENT_API_PREFIX}/soc/summary`, {
-            cache: 'no-store',
-            headers: { authorization: `Bearer ${token}` },
-          })
-            .then((r) => (r.ok ? r.json() : null))
-            .catch(() => null)
-        : Promise.resolve(null),
-      token
-        ? fetch(`${CLIENT_API_PREFIX}/soc/ops-status`, {
-            cache: 'no-store',
-            headers: { authorization: `Bearer ${token}` },
-          })
-            .then((r) => (r.ok ? r.json() : null))
-            .catch(() => null)
-        : Promise.resolve(null),
+      fetchJson<AlertItem[]>('/alerts/alerts'),
+      fetchJson<CaseItem[]>('/cases/cases'),
+      fetch(`${CLIENT_API_PREFIX}/soc/summary`, { cache: 'no-store', credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
+      fetch(`${CLIENT_API_PREFIX}/soc/ops-status`, { cache: 'no-store', credentials: 'include' })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
     ]);
     setAlerts(Array.isArray(a) ? a : []);
     setCases(Array.isArray(c) ? c : []);
     setSoc(s && typeof s === 'object' ? (s as SocSummary) : null);
     setOps(o && typeof o === 'object' ? (o as OpsHealth) : null);
-    setLoaded(true);
   }, []);
 
   useEffect(() => {
     load();
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === 'sirp_token') load();
+    const onVis = () => {
+      if (document.visibilityState === 'visible') load();
     };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
   }, [load]);
 
   const critical = alerts.filter((a) => a.severity?.toLowerCase() === 'critical').length;
@@ -130,8 +115,6 @@ export default function DashboardClient() {
   const recent = [...alerts].sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || '')).slice(0, 8);
   const recentCases = [...cases].sort((a, b) => Date.parse(b.created_at || '') - Date.parse(a.created_at || '')).slice(0, 5);
 
-  const noToken = loaded && typeof window !== 'undefined' && !localStorage.getItem('sirp_token');
-
   return (
     <>
       <div className="page-hd">
@@ -141,13 +124,6 @@ export default function DashboardClient() {
         </div>
         <a href="/alerts" className="btn btn-primary">+ New Alert</a>
       </div>
-
-      {noToken && (
-        <p className="text-muted mb-4" style={{ fontSize: 13 }}>
-          Sign in to load alerts and cases.{' '}
-          <a href="/login">Go to login</a>
-        </p>
-      )}
 
       <div className="kpi-row">
         <div className="kpi-box red">
@@ -172,7 +148,7 @@ export default function DashboardClient() {
         </div>
       </div>
 
-      {ops && !noToken ? (
+      {ops ? (
         <div className="card mb-4" style={{ padding: 14 }}>
           <div className="card-title mb-2 flex gap-2 items-center flex-wrap">
             Platform health
@@ -215,7 +191,7 @@ export default function DashboardClient() {
         </div>
       ) : null}
 
-      {soc && !noToken ? (
+      {soc ? (
         <div className="card mb-4" style={{ padding: 14 }}>
           <div className="card-title mb-2">SOC summary <span className="text-muted" style={{ fontWeight: 400, fontSize: 11 }}>(API)</span></div>
           <div className="flex gap-4 flex-wrap" style={{ fontSize: 13 }}>
@@ -282,7 +258,7 @@ export default function DashboardClient() {
               {!recent.length && (
                 <tr>
                   <td colSpan={6} className="empty-state">
-                    {noToken ? 'Sign in to see alerts.' : 'No alerts yet. Ingest from SIEM to get started.'}
+                    No alerts yet. Ingest from SIEM to get started.
                   </td>
                 </tr>
               )}
@@ -315,7 +291,7 @@ export default function DashboardClient() {
                 {!recentCases.length && (
                   <tr>
                     <td colSpan={3} className="empty-state">
-                      {noToken ? 'Sign in to see cases.' : 'No cases yet.'}
+                      No cases yet.
                     </td>
                   </tr>
                 )}

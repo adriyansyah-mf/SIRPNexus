@@ -52,10 +52,9 @@ export default function AlertDetailPage({ params }: { params: { id: string } }) 
   const [toast, setToast] = useState('');
 
   const load = async () => {
-    const token = localStorage.getItem('sirp_token') || '';
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${params.id}`, {
       cache: 'no-store',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     if (!res.ok) {
       setErr(res.status === 404 ? 'Alert not found.' : `Failed to load (${res.status})`);
@@ -71,10 +70,9 @@ export default function AlertDetailPage({ params }: { params: { id: string } }) 
   }, [params.id]);
 
   const escalate = async () => {
-    const token = localStorage.getItem('sirp_token') || '';
     const res = await fetch(`${CLIENT_API_PREFIX}/alerts/alerts/${params.id}/escalate`, {
       method: 'POST',
-      headers: token ? { authorization: `Bearer ${token}` } : {},
+      credentials: 'include',
     });
     const data = (await res.json().catch(() => ({}))) as {
       status?: string;
