@@ -23,7 +23,22 @@ db_pool: asyncpg.Pool | None = None
 
 OBSERVABLES: list[dict] = []
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-ELASTIC = os.getenv("ELASTICSEARCH_URL", "http://elastic:sirp@elasticsearch:9200")
+
+
+def _elasticsearch_url() -> str:
+    """If ELASTICSEARCH_URL has no credentials, inject elastic:ELASTIC_PASSWORD (default sirp)."""
+    raw = (os.getenv("ELASTICSEARCH_URL") or "").strip() or "http://elasticsearch:9200"
+    p = urlparse(raw)
+    if "@" in (p.netloc or ""):
+        return raw
+    pw = (os.getenv("ELASTIC_PASSWORD") or "sirp").strip()
+    netloc = p.netloc or "elasticsearch:9200"
+    auth_netloc = f"elastic:{quote(pw, safe='')}@{netloc}"
+    path = p.path if p.path else ""
+    return urlunparse((p.scheme or "http", auth_netloc, path, "", p.query, p.fragment))
+
+
+ELASTIC = _elasticsearch_url()
 ALLOW_INSECURE_NO_INTERNAL_TOKEN = os.getenv("ALLOW_INSECURE_NO_INTERNAL_TOKEN", "").strip().lower() in (
     "1",
     "true",
@@ -169,7 +184,7 @@ async def create_observable(data: dict):
             "INSERT INTO observables(id, payload, created_at) VALUES($1, $2::jsonb, now()) "
             "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload",
             doc_id,
-            doc,
+            json.dumps(doc),
         )
     try:
         await es.index(index="observables", document=doc)

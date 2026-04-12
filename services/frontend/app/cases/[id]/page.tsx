@@ -5,6 +5,7 @@ import { CLIENT_API_PREFIX } from '../../../lib/clientApi';
 import { openctiKnowledgeSearchUrl } from '../../../lib/openctiLinks';
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import CaseInvestigation from './CaseInvestigation';
+import IocLinkGraphModal from './IocLinkGraphModal';
 import CaseSocTab from './CaseSocTab';
 
 type CaseEvidence = {
@@ -253,6 +254,7 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
   const [evidenceUploading, setEvidenceUploading] = useState(false);
   const [intelSource, setIntelSource] = useState<IntelSource>('opencti');
   const [intelModal, setIntelModal] = useState<IntelLookupModal | null>(null);
+  const [iocGraph, setIocGraph] = useState<{ type: string; value: string } | null>(null);
   const [sourceAlert, setSourceAlert] = useState<SourceAlertPreview | null>(null);
   const [sourceAlertErr, setSourceAlertErr] = useState('');
   const toastRef = useRef<ReturnType<typeof setTimeout>>();
@@ -1171,7 +1173,8 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
               <tr>
                 <th>Type</th>
                 <th>Value</th>
-                <th style={{ minWidth: 220 }}>Threat intel</th>
+                <th style={{ minWidth: 200 }}>Threat intel</th>
+                <th style={{ minWidth: 160 }}>Correlations</th>
               </tr>
             </thead>
             <tbody>
@@ -1217,10 +1220,21 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
                         ) : null}
                       </div>
                     </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn-primary"
+                        style={{ fontSize: 12, padding: '4px 10px' }}
+                        title="Find other alerts with this IOC and show a link graph"
+                        onClick={() => setIocGraph({ type: o.type, value: o.value })}
+                      >
+                        Alerts & graph
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
-              {!c.observables?.length && <tr><td colSpan={3}><div className="empty-state">No observables.</div></td></tr>}
+              {!c.observables?.length && <tr><td colSpan={4}><div className="empty-state">No observables.</div></td></tr>}
             </tbody>
           </table>
         </div>
@@ -1336,6 +1350,13 @@ export default function CaseDetail({ params }: { params: { id: string } }) {
           </div>
         </div>
       )}
+
+      <IocLinkGraphModal
+        open={iocGraph != null}
+        onClose={() => setIocGraph(null)}
+        iocType={iocGraph?.type ?? ''}
+        iocValue={iocGraph?.value ?? ''}
+      />
 
       {toast && <div className={`toast ${toastOk ? 'success' : 'error'}`}>{toast}</div>}
     </div>

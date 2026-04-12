@@ -37,7 +37,22 @@ _OPENCTI_LOGIN_JWT_TTL_SEC = 600.0
 ALERTS: list[dict[str, Any]] = []
 
 KAFKA = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-ELASTIC_URL = os.getenv("ELASTICSEARCH_URL", "http://elastic:sirp@elasticsearch:9200")
+
+
+def _elasticsearch_url() -> str:
+    """If ELASTICSEARCH_URL has no credentials in the host part, inject elastic:ELASTIC_PASSWORD (default sirp)."""
+    raw = (os.getenv("ELASTICSEARCH_URL") or "").strip() or "http://elasticsearch:9200"
+    p = urlparse(raw)
+    if "@" in (p.netloc or ""):
+        return raw
+    pw = (os.getenv("ELASTIC_PASSWORD") or "sirp").strip()
+    netloc = p.netloc or "elasticsearch:9200"
+    auth_netloc = f"elastic:{quote(pw, safe='')}@{netloc}"
+    path = p.path if p.path else ""
+    return urlunparse((p.scheme or "http", auth_netloc, path, "", p.query, p.fragment))
+
+
+ELASTIC_URL = _elasticsearch_url()
 _DEFAULT_INGEST_NETS = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
 INGEST_ALLOWLIST = [
     v.strip() for v in os.getenv("INGEST_ALLOWLIST", _DEFAULT_INGEST_NETS).split(",") if v.strip()
@@ -1106,6 +1121,65 @@ async def siem_retro_search(q: str, size: int = 40, index: str | None = None):
     else:
         total_v = total
     return {"index": idx, "query": qn, "total": total_v, "hits": hits_out}
+
+
+@app.get("/alerts/by-observable")
+async def alerts_by_observable(type: str, value: str, limit: int = 50):
+    """Alerts that contain this IOC (exact type + value, same 500-char cap as /related)."""
+    try:
+        lim = int(limit)
+    except (TypeError, ValueError):
+        lim = 50
+    lim = max(1, min(lim, 100))
+    ot = str(type or "other").strip() or "other"
+    val = str(value or "").strip()
+    if not val:
+        raise HTTPException(status_code=400, detail="value required")
+    val = val[:800]
+    needle = (ot, val[:500])
+    hits: list[dict[str, Any]] = []
+    for a in await _all_alerts_payloads():
+        if not isinstance(a, dict):
+            continue
+        aid = str(a.get("id", ""))
+        if not aid:
+            continue
+        oset = {
+            (str(o.get("type", "other")), str(o.get("value", ""))[:500])
+            for o in (a.get("observables") or [])
+            if isinstance(o, dict) and o.get("value")
+        }
+        if needle not in oset:
+            continue
+        obs_list = a.get("observables") or []
+        safe_obs: list[dict[str, str]] = []
+        if isinstance(obs_list, list):
+            for o in obs_list[:60]:
+                if isinstance(o, dict) and o.get("value"):
+                    safe_obs.append(
+                        {
+                            "type": str(o.get("type") or "other"),
+                            "value": str(o.get("value", ""))[:400],
+                        }
+                    )
+        hits.append(
+            {
+                "id": aid,
+                "title": a.get("title"),
+                "source": a.get("source"),
+                "severity": a.get("severity"),
+                "status": a.get("status"),
+                "created_at": a.get("created_at"),
+                "case_id": a.get("case_id"),
+                "observables": safe_obs,
+            }
+        )
+    hits.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return {
+        "observable": {"type": ot, "value": val[:500]},
+        "count": len(hits),
+        "alerts": hits[:lim],
+    }
 
 
 @app.get("/alerts/{alert_id}")
