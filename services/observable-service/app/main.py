@@ -127,6 +127,17 @@ _ALLOWED_IOC_TYPES = frozenset(
 )
 
 
+def _row_payload(payload: object) -> dict:
+    """asyncpg may return JSONB as dict or (in edge cases) as a JSON string."""
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, str):
+        return json.loads(payload)
+    if isinstance(payload, (bytes, bytearray)):
+        return json.loads(payload.decode())
+    raise TypeError(f"unexpected observables.payload type: {type(payload)}")
+
+
 def _validate_ioc(data: dict) -> None:
     t = (data.get("type") or "").strip().lower()
     if t not in _ALLOWED_IOC_TYPES:
@@ -140,7 +151,7 @@ def _validate_ioc(data: dict) -> None:
 async def list_observables():
     if db_pool:
         rows = await db_pool.fetch("SELECT payload FROM observables ORDER BY created_at DESC LIMIT 1000")
-        return [dict(r["payload"]) for r in rows]
+        return [_row_payload(r["payload"]) for r in rows]
     return OBSERVABLES
 
 
@@ -158,7 +169,7 @@ async def create_observable(data: dict):
             "INSERT INTO observables(id, payload, created_at) VALUES($1, $2::jsonb, now()) "
             "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload",
             doc_id,
-            json.dumps(doc),
+            doc,
         )
     try:
         await es.index(index="observables", document=doc)
