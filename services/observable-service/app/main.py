@@ -37,7 +37,7 @@ async def startup():
     global consumer, redis_client, es, db_pool
     consumer = AIOKafkaConsumer("observables.created", bootstrap_servers=KAFKA, group_id="observable-service")
     await consumer.start()
-    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://:sirp@redis:6379/0"))
     es = AsyncElasticsearch(hosts=[ELASTIC])
     db_pool = await asyncpg.create_pool(
         host=os.getenv("POSTGRES_HOST", "postgres"),

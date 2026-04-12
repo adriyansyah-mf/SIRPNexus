@@ -952,7 +952,7 @@ async def startup():
     global producer, redis_client, es, db_pool, opencti_sync_task
     producer = AIOKafkaProducer(bootstrap_servers=KAFKA)
     await producer.start()
-    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"))
+    redis_client = Redis.from_url(os.getenv("REDIS_URL", "redis://:sirp@redis:6379/0"))
     es = AsyncElasticsearch(hosts=[ELASTIC_URL])
     db_pool = await asyncpg.create_pool(
         host=os.getenv("POSTGRES_HOST", "postgres"),

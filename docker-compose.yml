@@ -27,6 +27,21 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-sirp}
+    command:
+      - redis-server
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - allkeys-lru
+      - --requirepass
+      - "${REDIS_PASSWORD:-sirp}"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
     environment:
