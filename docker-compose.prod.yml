@@ -238,6 +238,8 @@ services:
     restart: always
     env_file: .env
     ports: ["3000:3000"]
+    environment:
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
     depends_on:
       api-gateway:
         condition: service_healthy
